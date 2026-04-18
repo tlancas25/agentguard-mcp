@@ -7,6 +7,30 @@ AgentGuard uses [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.1.1] - 2026-04-18
+
+### Added
+
+- `tests/test_signing_requirements.py`: federal-mode signing key enforcement tests for both stdio server and HTTP gateway
+- `tests/test_oscal_report.py`: OSCAL control extraction tests covering both current (`events`) and legacy (`audit_events`) audit table names
+
+### Changed
+
+- `agentguard/server.py:StdioServer.__init__` now raises `ValueError` at startup if `mode=federal` and no valid Ed25519 signing key is configured. No silent downgrade to unsigned audit.
+- `agentguard/gateway.py:create_app` has the same fail-fast validation for HTTP gateway federal deployments.
+- `pyproject.toml`: removed stale pytest asyncio configuration warning.
+
+### Security
+
+- Federal mode can no longer start without non-repudiation signing infrastructure in place. This closes a silent-downgrade vector where an operator could intend federal mode but receive unsigned audit output.
+
+### Repo
+
+- Initial public release to https://github.com/tlancas25/agentguard-mcp
+- Published under MIT License
+
+---
+
 ## [0.1.0] - 2026-04-18
 
 ### Added

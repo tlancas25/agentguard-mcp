@@ -1,7 +1,18 @@
 # AgentGuard MCP -- Handoff Document
 
-**Last updated:** 2026-04-18
-**Project phase:** MVP scaffold + research-backed NIST updates complete. Pre-git-init.
+**Last updated:** 2026-04-18 (post-hardening patch)
+**Project phase:** MVP scaffold + research-backed NIST updates + federal-mode signing enforcement. Published: https://github.com/tlancas25/agentguard-mcp
+**Current version:** 0.1.1
+
+## Recent Commits
+
+- `69d962c` test: remove stale pytest asyncio config warning (2026-04-18)
+- `50ef894` Initial commit: AgentGuard MCP scaffold and hardening fixes (2026-04-18)
+
+The hardening commit added:
+- `tests/test_signing_requirements.py`: enforces federal mode cannot start without a valid Ed25519 signing key (ValueError at init)
+- `tests/test_oscal_report.py`: validates OSCAL control extraction against both current (`events`) and legacy (`audit_events`) audit table names
+- Fail-fast validation in `agentguard/server.py:StdioServer.__init__` and `agentguard/gateway.py:create_app` when federal mode is selected without signing material
 
 ---
 
@@ -23,7 +34,7 @@
 | Policy engine | Complete | `agentguard/policy_engine.py` : dev mode logs, federal mode enforces deny-by-default |
 | Dual-mode config | Complete | `agentguard/modes.py`, `agentguard/config.py` |
 | Hash-chained audit log | Complete | `agentguard/audit_log.py` |
-| Ed25519 signing | Complete | Optional in dev, startup-enforced in federal (`agentguard/server.py`, `agentguard/gateway.py`) |
+| Ed25519 signing | Complete + hardened | Optional in dev, startup-enforced in federal (`agentguard/server.py:StdioServer.__init__`, `agentguard/gateway.py:create_app`); ValueError on missing/invalid key |
 | Detectors | Complete | prompt_injection, pii, secrets, tool_poisoning |
 | NIST 800-53 Rev 5.2 controls | Complete | 20 controls in `agentguard/nist/controls_800_53.py` |
 | NIST AI RMF 1.0 mapping | Complete | `agentguard/nist/ai_rmf.py` |
@@ -44,7 +55,8 @@
 | DoD PKI/CAC auth | Planned v0.2 | IA-2 is lightweight only |
 | PQC audit signing (ML-DSA) | Planned v0.3 | Ed25519 in v0.1 |
 | React dashboard | Not planned | Stay CLI-first; competitors have dashboards |
-| PyPI package | Post-git-init | Needs git and CI/CD first |
+| PyPI package | Planned v0.2 | Repo is live; needs release workflow tag-trigger verification |
+| Repo description + topics on GitHub | TODO | Currently empty on github.com/tlancas25/agentguard-mcp |
 
 ---
 
