@@ -13,6 +13,49 @@
 [![FedRAMP 20x](https://img.shields.io/badge/FedRAMP%2020x-Class%20B%2FC-blue)](docs/fedramp-deployment.md)
 [![CMMC 2.0](https://img.shields.io/badge/CMMC%202.0-L2%2FL3%20Roadmap-yellow)](docs/nist-mapping.md)
 [![OSCAL 1.1.2](https://img.shields.io/badge/OSCAL-1.1.2-green)](agentguard/reports/oscal.py)
+[![GitHub stars](https://img.shields.io/github/stars/tlancas25/agentguard-mcp?style=social)](https://github.com/tlancas25/agentguard-mcp)
+
+---
+
+## One-Line Install
+
+**macOS / Linux:**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/tlancas25/agentguard-mcp/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/tlancas25/agentguard-mcp/main/install.ps1 | iex
+```
+
+Each installer detects your platform, installs [uv](https://github.com/astral-sh/uv) if needed, provisions an isolated Python 3.11+ environment, and installs the `agentguard` CLI globally. Idempotent and safe to re-run. See [Install options](#install-options) below for other methods.
+
+---
+
+## Table of Contents
+
+- [The Problem](#the-problem)
+- [The Solution](#the-solution)
+- [Features](#features)
+- [Quick Start](#quick-start)
+  - [Install options](#install-options)
+  - [Initialize config](#initialize-config)
+  - [Run the gateway](#run-the-gateway)
+  - [Add to Claude Code](#add-to-claude-code)
+- [Architecture](#architecture)
+- [Compatibility](#compatibility)
+- [Defensible Claims](#defensible-claims)
+- [NIST 800-53 Rev 5.2 Controls](#nist-800-53-rev-52-controls)
+- [NIST AI RMF Coverage](#nist-ai-rmf-coverage)
+- [Integration Examples](#integration-examples)
+- [Comparison](#comparison)
+- [Security Disclaimer](#security-disclaimer)
+- [Project Docs](#project-docs)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
@@ -47,6 +90,20 @@ One tool, two modes, the same codebase.
 
 ---
 
+## Who This Is For
+
+AgentGuard is useful if any of the following applies:
+
+- **You deploy AI agents in a regulated environment** (federal agency, defense contractor, healthcare, finance, critical infrastructure). You need audit evidence that satisfies ATO, FedRAMP, CMMC, or internal risk management.
+- **You are a security engineer integrating Claude Code, Cursor, or custom MCP clients** into a production workflow and need a policy boundary between the agent and the tools it can touch.
+- **You run a SOC or GRC function** and want tamper-evident logs of every AI agent tool call, signed for non-repudiation.
+- **You are a cleared professional** evaluating AI governance tooling for a federal customer and want something open-source that speaks NIST 800-53 Rev 5.2 and OSCAL natively.
+- **You are a developer** who wants to log every MCP tool call in a local project for debugging, and you want zero friction (dev mode is pass-through by default).
+
+If you just want a personal chat with an LLM, you do not need AgentGuard. Start needing it the moment an agent can write files, call APIs, or execute code on your behalf.
+
+---
+
 ## Features
 
 | Capability | Dev Mode | Federal Mode |
@@ -71,30 +128,50 @@ One tool, two modes, the same codebase.
 
 ## Quick Start
 
-### Install
+### Install options
 
-```bash
-pip install agentguard-mcp
-```
+Pick the path that matches your environment. All paths land on the same `agentguard` CLI.
 
-Or run without installing:
+| Method | Command | Best for |
+|---|---|---|
+| **One-line (macOS / Linux)** | `curl -sSL https://raw.githubusercontent.com/tlancas25/agentguard-mcp/main/install.sh \| bash` | Fresh machines, CI runners, first-time users |
+| **One-line (Windows)** | `irm https://raw.githubusercontent.com/tlancas25/agentguard-mcp/main/install.ps1 \| iex` | Windows 10/11 PowerShell 5.1+ |
+| **uv (recommended, any OS)** | `uv tool install git+https://github.com/tlancas25/agentguard-mcp.git` | Developers already using uv |
+| **pipx (isolated, any OS)** | `pipx install git+https://github.com/tlancas25/agentguard-mcp.git` | Python users who prefer pipx |
+| **pip (any OS)** | `pip install git+https://github.com/tlancas25/agentguard-mcp.git` | Quick test in an existing venv |
+| **uvx (ephemeral run, any OS)** | `uvx --from git+https://github.com/tlancas25/agentguard-mcp.git agentguard run` | Try without installing |
+| **Clone + editable** | `git clone https://github.com/tlancas25/agentguard-mcp.git && cd agentguard-mcp && pip install -e .[dev]` | Contributors |
 
-```bash
-uvx agentguard run
-```
+> PyPI release (`pip install agentguard-mcp` without the git URL) is planned for v0.2. Until then, the one-line installers and git-based commands above are authoritative.
 
-### Initialize Config
+**Requirements:** Python 3.11 or later. The one-line installers will bootstrap a compatible Python via uv if your system Python is older.
+
+### Initialize config
 
 ```bash
 agentguard init
 ```
 
-This creates `agentguard.yaml` in your current directory with dev mode defaults.
-
-### Run the Gateway
+This creates `agentguard.yaml` in your current directory with dev mode defaults. Federal operators should also generate a signing key:
 
 ```bash
+agentguard init --gen-key
+```
+
+### Run the gateway
+
+```bash
+# Dev mode: permissive pass-through, log-only, no workflow friction
 agentguard run --mode dev
+
+# Federal mode: deny-by-default, signed audit, fail-fast if signing key is missing
+AGENTGUARD_SIGNING_KEY=/path/to/ed25519.key agentguard run --mode federal
+```
+
+Verify the audit chain at any time:
+
+```bash
+agentguard audit verify
 ```
 
 ### Add to Claude Code
@@ -313,6 +390,28 @@ Competitors exist and are worth knowing. This table reflects publicly documented
 **Where AgentGuard does not win:** No SaaS dashboard; smaller community; no Kubernetes-native deployment; OPA/Rego policy engine planned for v0.2 only.
 
 AgentGuard does not claim to be first or exclusive. It claims to be purpose-built for the federal and defense use case with native compliance language.
+
+---
+
+## Project Docs
+
+Every claim in this README traces to a document or code file. If it is not cited, it is not claimed.
+
+| Document | What's in it |
+|---|---|
+| [`docs/research-brief-2026.md`](docs/research-brief-2026.md) | Source of truth for every compliance claim: EO 14179, OMB M-25-21/22, NIST AI 600-1, FedRAMP 20x, CMMC 2.0, DoD Zero Trust, OWASP LLM 2025, MITRE ATLAS v5.4.0, PQC timelines. Read this before modifying any NIST code. |
+| [`docs/nist-mapping.md`](docs/nist-mapping.md) | Full control mapping across NIST 800-53 Rev 5.2, NIST AI RMF 1.0, NIST AI 600-1, OWASP LLM 2025, MITRE ATLAS, and CMMC 2.0 |
+| [`docs/threat-model.md`](docs/threat-model.md) | MITRE ATLAS-organized threat model, in-scope vs out-of-scope, Palo Alto Unit 42 MCP attack coverage |
+| [`docs/architecture.md`](docs/architecture.md) | Component architecture, transport layers, audit chain design |
+| [`docs/getting-started.md`](docs/getting-started.md) | 10-minute first run guide |
+| [`docs/policies.md`](docs/policies.md) | YAML policy DSL reference |
+| [`docs/claude-code-setup.md`](docs/claude-code-setup.md) | Full Claude Code integration walkthrough |
+| [`docs/fedramp-deployment.md`](docs/fedramp-deployment.md) | FedRAMP ATO workflow using AgentGuard evidence output |
+| [`CLAUDE.md`](CLAUDE.md) | AI pair-programming context for contributors |
+| [`HANDOFF.md`](HANDOFF.md) | Session continuity document: what's done, what's stubbed, design decisions, maintenance cadence |
+| [`CHANGELOG.md`](CHANGELOG.md) | Versioned change history |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute NIST controls, attack patterns, integrations |
+| [`skills/agentguard/SKILL.md`](skills/agentguard/SKILL.md) | Behavioral guidelines for using AgentGuard as a Claude Code / Cursor skill |
 
 ---
 
