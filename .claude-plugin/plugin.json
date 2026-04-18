@@ -1,0 +1,23 @@
+{
+  "name": "agentguard-mcp",
+  "description": "Open-source MCP security gateway with native NIST 800-53 and FedRAMP compliance. Intercepts AI agent tool calls, enforces policy, generates federal audit evidence. Works transparently with Claude Code, Cursor, and any MCP client.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Terrell Lancaster",
+    "url": "https://github.com/tlancas25"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "security",
+    "ai-agent",
+    "nist",
+    "fedramp",
+    "dod",
+    "compliance",
+    "claude-code",
+    "ai-governance",
+    "zero-trust"
+  ],
+  "skills": ["./skills/agentguard"]
+}

@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentguard-mcp"
+version = "0.1.0"
+description = "Open-source MCP security gateway with native NIST 800-53 and FedRAMP compliance"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Terrell Lancaster", email = "tlancas25@gmail.com" },
+]
+keywords = [
+    "mcp",
+    "security",
+    "ai-agent",
+    "nist",
+    "fedramp",
+    "dod",
+    "compliance",
+    "claude-code",
+    "ai-governance",
+    "zero-trust",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "click>=8.1",
+    "cryptography>=42.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+    "mypy>=1.5",
+    "bandit>=1.7",
+    "pip-audit>=2.6",
+    "types-pyyaml>=6.0",
+]
+
+[project.scripts]
+agentguard = "agentguard.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/tlancas25/agentguard-mcp"
+Repository = "https://github.com/tlancas25/agentguard-mcp"
+Issues = "https://github.com/tlancas25/agentguard-mcp/issues"
+Changelog = "https://github.com/tlancas25/agentguard-mcp/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentguard"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "UP", "S", "B"]
+ignore = ["S101", "S603"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "venv"]
+skips = ["B101"]

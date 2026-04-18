@@ -1,0 +1,67 @@
+# Sample Policy: Deny Destructive Operations
+#
+# Permits most tool calls but explicitly denies tools that could
+# cause irreversible damage (delete files, execute arbitrary code,
+# modify production systems).
+#
+# Use case: A development assistant that can read and create files
+# but cannot delete them or execute shell commands.
+
+name: deny_destructive_ops
+description: Deny irreversible or high-risk tool operations. Allow everything else.
+
+default_action: log
+
+tool_allowlist: []
+
+tool_denylist:
+  # Filesystem destructive ops
+  - filesystem_delete_file
+  - filesystem_delete_directory
+  - filesystem_move_file       # Can overwrite targets
+  - filesystem_write_file      # Remove from denylist if agent needs to write
+
+  # Code execution
+  - run_terminal_command
+  - execute_code
+  - bash
+  - shell
+  - python_repl
+  - javascript_eval
+
+  # Database destructive ops
+  - database_drop_table
+  - database_delete_rows
+  - database_truncate
+
+  # Git destructive ops
+  - git_force_push
+  - git_reset_hard
+  - git_delete_branch
+
+  # Cloud destructive ops
+  - aws_delete_s3_object
+  - aws_delete_ec2_instance
+  - gcp_delete_resource
+
+pii_scan: false
+injection_scan: false
+tool_poisoning_scan: true
+require_signing: false
+
+rules:
+  - name: deny_all_shell
+    tool_prefix: "shell_"
+    action: deny
+    reason: "Shell execution tools are never permitted."
+    nist_controls:
+      - AC-3
+      - AC-6
+
+  - name: deny_all_exec
+    tool_prefix: "exec_"
+    action: deny
+    reason: "Execution tools are never permitted."
+    nist_controls:
+      - AC-3
+      - AC-6

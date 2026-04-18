@@ -1,0 +1,73 @@
+# AgentGuard Federal Mode Default Policy
+#
+# Strict enforcement policy for federal and regulated deployments.
+# Implements NIST 800-53 Rev 5 AC-3 (Access Enforcement) and AC-6 (Least Privilege).
+# DENY by default. Explicit allowlist required. Full detector stack enabled.
+#
+# IMPORTANT: You must populate tool_allowlist with the tools your system
+# legitimately uses. The empty allowlist below will deny ALL tool calls.
+#
+# NIST controls addressed:
+# - AC-3: Access Enforcement (tool allowlist/denylist)
+# - AC-6: Least Privilege (deny by default)
+# - AU-2: Event Logging
+# - SI-4: System Monitoring (detectors enabled)
+# - SI-10: Information Input Validation (PII and injection scanning)
+# - AU-9: Protection of Audit Information (signing required)
+# - AU-10: Non-repudiation (signed audit trail)
+
+name: federal_mode_defaults
+description: Strict federal defaults. Deny by default. Full scanning. Signed audit required.
+
+# Default: deny any tool call not explicitly allowed
+default_action: deny
+
+# REQUIRED: List tools your system is authorized to use.
+# Example:
+# tool_allowlist:
+#   - filesystem_read_file
+#   - filesystem_list_directory
+#   - github_get_file_contents
+#   - github_list_commits
+tool_allowlist: []
+
+# Explicitly blocked tools (evaluated before allowlist)
+# Add destructive or high-risk tools here as a belt-and-suspenders measure.
+tool_denylist:
+  - filesystem_write_file    # Remove if your system needs file writes
+  - filesystem_delete_file
+  - run_terminal_command
+  - execute_code
+  - bash
+  - shell
+
+# Enable all detectors in federal mode
+pii_scan: true
+injection_scan: true
+tool_poisoning_scan: true
+
+# Require signed audit events (Ed25519)
+require_signing: true
+
+# Federal enforcement rules
+rules:
+  # Log all session events (always first rule)
+  - name: log_session_events
+    tool: "initialize"
+    action: log
+    reason: "Session events are always logged."
+    nist_controls: ["IA-2", "AU-2"]
+
+  # Deny resources/read unless explicitly allowed
+  - name: deny_resources_read
+    tool: "resources/read"
+    action: deny
+    reason: "Resource reads require explicit authorization in federal mode."
+    nist_controls: ["AC-3", "AC-6"]
+
+  # Deny prompts/get unless explicitly allowed
+  - name: deny_prompts_get
+    tool: "prompts/get"
+    action: deny
+    reason: "Prompt access requires explicit authorization in federal mode."
+    nist_controls: ["AC-3"]

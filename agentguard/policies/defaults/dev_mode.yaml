@@ -1,0 +1,33 @@
+# AgentGuard Dev Mode Default Policy
+#
+# Permissive pass-through policy for daily development use.
+# ALL tool calls are logged but NONE are blocked.
+# Designed for use with Claude Code, Cursor, and OpenClaw without friction.
+#
+# NIST controls addressed in logging-only mode:
+# - AU-2: Event Logging (all calls logged)
+# - AU-3: Content of Audit Records (full args captured)
+# - AU-12: Audit Record Generation (automatic)
+
+name: dev_mode_defaults
+description: Permissive defaults for development. Log everything, block nothing.
+
+# Default: log all tool calls that don't match any rule
+default_action: log
+
+# No tool allowlist in dev mode — everything is permitted
+tool_allowlist: []
+
+# No tool denylist in dev mode — nothing is explicitly blocked
+tool_denylist: []
+
+# Detectors off by default in dev mode (too noisy for daily work)
+pii_scan: false
+injection_scan: false
+tool_poisoning_scan: true    # Always scan tool descriptions (low noise, high value)
+
+# No signing requirement in dev mode
+require_signing: false
+
+# Rules: none in dev mode. Add your own if you want selective logging.
+rules: []

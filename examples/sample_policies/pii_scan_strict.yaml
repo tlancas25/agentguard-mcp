@@ -1,0 +1,43 @@
+# Sample Policy: Strict PII Scanning
+#
+# Enables PII detection with deny action on all tool calls.
+# Any tool call containing PII (SSN, credit card, email, phone, etc.)
+# is blocked before it reaches the upstream MCP server.
+#
+# Use case: Healthcare or financial systems where PII must not
+# flow through AI agent tool calls without explicit authorization.
+
+name: pii_scan_strict
+description: Block any tool call containing PII. All other calls are logged.
+
+default_action: log
+
+tool_allowlist: []
+tool_denylist: []
+
+pii_scan: true
+injection_scan: true
+tool_poisoning_scan: true
+require_signing: false
+
+rules:
+  # Allow health data tools that legitimately need PII (explicit override)
+  - name: allow_authorized_health_tools
+    tool: authorized_ehr_read
+    action: allow
+    reason: "Authorized EHR tools may process PHI per system authorization."
+    nist_controls:
+      - AC-3
+      - AU-2
+
+  # Deny any write operation with data args (high PII risk)
+  - name: deny_writes_with_content
+    tool: filesystem_write_file
+    has_args:
+      - content
+    action: deny
+    reason: "File writes with content arg require explicit PII review."
+    nist_controls:
+      - AC-3
+      - SI-10
+      - SC-28

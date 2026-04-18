@@ -1,0 +1,52 @@
+# Sample Policy: Allow GitHub Tools Only
+#
+# Restricts the AI agent to only GitHub-related MCP tool calls.
+# All other tools are denied.
+#
+# Use case: A code review agent that should only read GitHub data,
+# not touch the filesystem or execute commands.
+
+name: allow_github_only
+description: Allow only GitHub MCP server tools. Deny everything else.
+
+default_action: deny
+
+tool_allowlist:
+  # GitHub MCP server tools (mcp-server-github)
+  - get_file_contents
+  - list_commits
+  - list_branches
+  - list_pull_requests
+  - get_pull_request
+  - list_issues
+  - get_issue
+  - search_code
+  - search_repositories
+  - get_repository
+  - list_repository_files
+
+tool_denylist:
+  # Explicitly block any tool that could write or execute
+  - create_pull_request
+  - merge_pull_request
+  - push_files
+  - create_issue
+  - run_terminal_command
+  - execute_code
+  - filesystem_write_file
+  - filesystem_delete_file
+
+pii_scan: true
+injection_scan: true
+tool_poisoning_scan: true
+require_signing: false
+
+rules:
+  - name: log_all_reads
+    tool: "*"
+    action: allow
+    reason: "Allowlisted tools are permitted with audit logging."
+    nist_controls:
+      - AC-3
+      - AU-2
+      - AU-12

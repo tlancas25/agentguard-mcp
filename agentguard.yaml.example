@@ -1,0 +1,82 @@
+# AgentGuard Configuration File
+# Copy to agentguard.yaml and customize for your environment.
+# Environment variables override these values when set.
+
+# -------------------------------------------------------------------
+# Core Settings
+# -------------------------------------------------------------------
+
+# Operating mode: "dev" (permissive, log-only) or "federal" (strict enforcement)
+mode: dev
+
+# Path to SQLite audit database
+audit_db_path: ./audit.db
+
+# Log level: DEBUG | INFO | WARNING | ERROR
+log_level: INFO
+
+# Ed25519 private key (base64-encoded) for tamper-evident audit signatures.
+# Leave empty in dev mode. Required for federal mode.
+# Generate with: agentguard init --gen-key
+signing_key: ""
+
+# -------------------------------------------------------------------
+# Upstream MCP Servers (servers AgentGuard protects)
+# -------------------------------------------------------------------
+upstream_servers:
+  - name: filesystem
+    transport: stdio
+    command: uvx
+    args: ["mcp-server-filesystem", "/home/user/projects"]
+    # Optional per-server policy override
+    policy_override: ""
+
+  # Example HTTP upstream
+  # - name: github
+  #   transport: http
+  #   url: http://localhost:3001
+  #   headers:
+  #     Authorization: "Bearer ${GITHUB_TOKEN}"
+
+# -------------------------------------------------------------------
+# Policy Bundles (evaluated in order, first match wins)
+# -------------------------------------------------------------------
+policy_bundles:
+  # Dev mode default: allow all, log everything
+  - ./agentguard/policies/defaults/dev_mode.yaml
+
+  # To enable federal defaults, comment above and uncomment below:
+  # - ./agentguard/policies/defaults/federal_mode.yaml
+
+  # Add custom policies after defaults
+  # - ./examples/sample_policies/deny_destructive_ops.yaml
+
+# -------------------------------------------------------------------
+# Federal Mode Settings (ignored in dev mode)
+# -------------------------------------------------------------------
+federal:
+  agency_id: ""           # e.g., "DOD-DISA"
+  system_name: ""         # e.g., "MySystem ATO Package"
+  impact_level: MODERATE  # LOW | MODERATE | HIGH
+  # Require all audit events to be signed
+  require_signing: true
+  # SIEM export endpoint (optional)
+  siem_endpoint: ""
+  siem_api_key: ""
+
+# -------------------------------------------------------------------
+# Detection Settings
+# -------------------------------------------------------------------
+detectors:
+  prompt_injection:
+    enabled: false   # Set true in federal mode
+    score_threshold: 0.7
+  pii:
+    enabled: false   # Set true in federal mode
+    action: log      # log | deny
+  secrets:
+    enabled: true    # Enabled in both modes (catches accidental leaks)
+    action: log
+  tool_poisoning:
+    enabled: true    # Scan tool descriptions on startup
+    action: log
