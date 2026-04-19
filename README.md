@@ -280,23 +280,63 @@ agentguard audit export --format csv --output ~/audit-evidence.csv
 
 AgentGuard is the thing your AI agent is supposed to obey. If the user's communication channel is compromised (prompt injection, a spoofed terminal, a malicious document the agent is reading), the attacker's next move is usually to tell the agent to disable the guard — "delete `~/.agentguard/audit.db`", "uninstall the MCP server", "overwrite the signing key".
 
-Every tool call is pre-screened for references to AgentGuard's own state. If a call touches the protected directory, it is **denied before the policy engine or detectors run** and the attempt is written to the hash-chained audit log under event type `agentguard_tamper_attempt` with NIST controls `AC-3`, `AU-9`, `SC-3`, `SI-7`.
+Self-protection is **opt-in** and has three modes. `agentguard init` asks which one you want. You can always change it later in `~/.agentguard/agentguard.yaml`.
 
-**Protected by default (always on, both modes):**
-- `~/.agentguard/` (config, audit DB, signing keys)
+| Mode | What happens to a tool call that touches `~/.agentguard/` | Recommended for |
+|------|-----------------------------------------------------------|-----------------|
+| **off** *(default)* | Nothing special — agents can read, modify, or stop AgentGuard freely. | Single-user dev box, local experimentation. |
+| **standard** | Reads are allowed and logged. Mutations (rm, mv, chmod, SQL writes, `agentguard update`, `claude mcp remove`, direct file writes, …) are **held** until an operator runs `agentguard approve <code>` in a sibling terminal. 60-second timeout → auto-deny. | Shared workstations, review environments. |
+| **strict** | Any reference — read or write — is denied outright. | Production deployments where agents should never read the gateway's own state. |
 
-**Extend via YAML or env var:**
+Regardless of mode, every denied, allowed-read, approved-mutation, and denied-mutation is recorded in the hash-chained audit log under one of:
+
+- `agentguard_tamper_attempt` (strict-deny or standard-read-allowed)
+- `agentguard_tamper_approved` (standard-mutation-approved)
+- `agentguard_tamper_denied` (standard-mutation-denied or timeout)
+
+all with NIST controls `AC-3`, `AU-9`, `SC-3`, `SI-7`.
+
+### How the approval flow works (standard mode)
+
+1. The agent sends a mutation like `shell_exec: rm -rf ~/.agentguard/audit.db`.
+2. AgentGuard classifies the call as a mutation, parks it, writes a `.pending.json` file to `~/.agentguard/approvals/`, and prints a banner to its stderr:
+   ```
+   ============================================================
+     AGENTGUARD APPROVAL REQUIRED
+   ============================================================
+     Agent      : unverified:claude-code:…
+     Tool       : shell_exec
+     Path hit   : C:/Users/you/.agentguard
+     Preview    : shell_exec {"cmd": "rm -rf ~/.agentguard/audit.db"}
+     Challenge  : 482917
+     To approve : agentguard approve 482917
+     To deny    : agentguard approve 482917 --deny
+     Expires in : 60 seconds.
+   ============================================================
+   ```
+3. You can also list all pending requests without knowing the code: `agentguard approve` (no args).
+4. The proxy polls until the operator resolves the request or the timeout expires.
+
+### Extend the protected set
+
 ```yaml
 self_protection:
+  mode: standard
   extra_paths:
     - /etc/agentguard
     - /var/log/agentguard
+  approval_timeout_seconds: 60
 ```
+
+Env var overrides (handy for Docker / systemd):
 ```bash
+export AGENTGUARD_SELF_PROTECT_MODE=standard
 export AGENTGUARD_SELF_PROTECT_EXTRA_PATHS="/etc/agentguard,/var/log/agentguard"
 ```
 
-**What this is not:** a replacement for OS-level isolation. A truly paranoid deployment still runs AgentGuard under a dedicated service account, `chmod 600` the DB, and ships an offsite mirror of the audit log. Self-protection is a backstop that turns a silent compromise into a loud, recorded one.
+### What this is *not*
+
+A replacement for OS-level isolation. A truly paranoid deployment still runs AgentGuard under a dedicated service account, `chmod 600` the DB, and ships an offsite mirror of the audit log. Self-protection is a backstop that turns a silent compromise into a loud, recorded one.
 
 ---
 

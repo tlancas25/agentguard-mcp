@@ -34,11 +34,15 @@ from agentguard.nist.mappings import (
     EVENT_TOOL_POISONING_DETECTED,
     get_controls_for_event,
 )
+from agentguard.approvals import ApprovalManager, default_approvals_dir
 from agentguard.policy_engine import Decision, PolicyEngine
 from agentguard.self_protect import (
+    EVENT_TAMPER_APPROVED,
     EVENT_TAMPER_ATTEMPT,
+    EVENT_TAMPER_DENIED,
     NIST_CONTROLS as SELF_PROTECT_CONTROLS,
-    scan_tool_call as scan_self_protect,
+    ReferenceKind,
+    classify_self_reference,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,7 @@ class ProxyCore:
         self.mode = Mode(config.mode)
         self._identity_extractor = IdentityExtractor()
         self._current_identity: Optional[AgentIdentity] = None
+        self._approval_manager = ApprovalManager(default_approvals_dir())
 
     def handle_initialize(self, params: dict[str, Any]) -> None:
         """Process an MCP initialize request to extract agent identity."""
@@ -129,40 +134,17 @@ class ProxyCore:
         agent_id = self._get_agent_id()
         warnings: list[str] = []
 
-        # Self-protection: always-on, runs BEFORE detectors/policy so an
-        # attacker who has compromised the user channel cannot instruct
-        # the agent to disable or tamper with the gateway. The attempt
-        # is denied and recorded immutably in the hash-chained audit log.
-        sp = scan_self_protect(
-            tool_name, tool_args, self.config.self_protection.extra_paths
-        )
-        if sp.matched:
-            decision = Decision(
-                action="deny",
-                reason=sp.reason,
-                nist_controls=SELF_PROTECT_CONTROLS,
-            )
-            self.audit_log.append_event(
-                AuditEvent(
-                    agent_id=agent_id,
-                    event_type=EVENT_TAMPER_ATTEMPT,
-                    tool_name=tool_name,
-                    tool_args={
-                        "path_hit": sp.path_hit,
-                        "arg_preview": sp.arg_preview,
-                    },
-                    decision="deny",
-                    policy_matched="self_protection",
-                    nist_controls=SELF_PROTECT_CONTROLS,
-                )
-            )
-            logger.warning(
-                "[AgentGuard] Tamper attempt blocked: %s (tool=%s)",
-                sp.reason,
-                tool_name,
-            )
-            warnings.append(sp.reason)
-            return False, decision, warnings
+        # Self-protection: user-selected mode decides how strict we are.
+        # A non-None result is terminal — we don't re-evaluate through the
+        # policy engine. The operator-approved path shouldn't also have to
+        # pass the detector/policy stack, and a strict deny shouldn't be
+        # overwritten by the engine's default decision.
+        sp_decision = self._evaluate_self_protection(agent_id, tool_name, tool_args)
+        if sp_decision is not None:
+            should_forward, decision, sp_warnings = sp_decision
+            warnings.extend(sp_warnings)
+            self._log_tool_event(agent_id, tool_name, tool_args, None, decision)
+            return should_forward, decision, warnings
 
         # Run detector stack
         detection_controls: list[str] = []
@@ -296,31 +278,13 @@ class ProxyCore:
         """Log a resources/read request. Returns True if allowed."""
         agent_id = self._get_agent_id()
 
-        sp = scan_self_protect(
-            "resources/read",
-            {"uri": uri, **extra_args},
-            self.config.self_protection.extra_paths,
+        sp_decision = self._evaluate_self_protection(
+            agent_id, "resources/read", {"uri": uri, **extra_args}
         )
-        if sp.matched:
-            self.audit_log.append_event(
-                AuditEvent(
-                    agent_id=agent_id,
-                    event_type=EVENT_TAMPER_ATTEMPT,
-                    tool_name="resources/read",
-                    tool_args={
-                        "uri": uri,
-                        "path_hit": sp.path_hit,
-                        "arg_preview": sp.arg_preview,
-                    },
-                    decision="deny",
-                    policy_matched="self_protection",
-                    nist_controls=SELF_PROTECT_CONTROLS,
-                )
-            )
-            logger.warning(
-                "[AgentGuard] Resource read tamper attempt blocked: %s", sp.reason
-            )
-            return False
+        if sp_decision is not None:
+            should_forward, _decision, _warn = sp_decision
+            if not should_forward:
+                return False
 
         decision = self.policy_engine.evaluate("resources/read", {"uri": uri}, agent_id)
         self.audit_log.append_event(
@@ -352,6 +316,148 @@ class ProxyCore:
             )
         )
         return decision.is_allowed
+
+    def _evaluate_self_protection(
+        self,
+        agent_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> Optional[tuple[bool, Decision, list[str]]]:
+        """Apply the self-protection mode to a tool call.
+
+        Returns None when the feature is off or the call does not touch
+        AgentGuard state. Otherwise returns (should_forward, decision,
+        warnings) that the caller merges into its own flow.
+        """
+        sp_mode = self.config.self_protection.mode
+        if sp_mode == "off":
+            return None
+
+        result = classify_self_reference(
+            tool_name, tool_args, self.config.self_protection.extra_paths
+        )
+        if result.kind is ReferenceKind.NONE:
+            return None
+
+        # Strict mode: anything goes to deny.
+        if sp_mode == "strict":
+            decision = Decision(
+                action="deny",
+                reason=(
+                    f"Self-protection (strict): tool call references "
+                    f"'{result.path_hit}'. Change self_protection.mode "
+                    f"or run this operation from an operator terminal."
+                ),
+                nist_controls=SELF_PROTECT_CONTROLS,
+            )
+            self._log_tamper(
+                agent_id, tool_name, tool_args, result,
+                EVENT_TAMPER_ATTEMPT, "deny",
+            )
+            logger.warning("[AgentGuard] strict self-protection denied: %s", result.path_hit)
+            return False, decision, [decision.reason]
+
+        # Standard mode: reads are allowed (and logged).
+        if result.kind is ReferenceKind.READ:
+            self._log_tamper(
+                agent_id, tool_name, tool_args, result,
+                EVENT_TAMPER_ATTEMPT, "allowed",
+            )
+            decision = Decision(
+                action="allow",
+                reason=(
+                    f"Self-protection (standard): read of '{result.path_hit}' "
+                    f"allowed and logged."
+                ),
+                nist_controls=SELF_PROTECT_CONTROLS,
+            )
+            return True, decision, [decision.reason]
+
+        # Standard mode + mutation: ask the operator.
+        preview = self._preview_args(tool_name, tool_args)
+        approval = self._approval_manager.request(
+            tool_name=tool_name,
+            tool_args_preview=preview,
+            agent_id=agent_id,
+            mutate_reason=result.mutate_reason or "unknown",
+            path_hit=result.path_hit or "",
+            timeout_seconds=self.config.self_protection.approval_timeout_seconds,
+        )
+
+        if approval.approved:
+            self._log_tamper(
+                agent_id, tool_name, tool_args, result,
+                EVENT_TAMPER_APPROVED, "approved",
+                code=approval.code,
+            )
+            decision = Decision(
+                action="allow",
+                reason=(
+                    f"Self-protection: operator approved code "
+                    f"{approval.code} for mutation ({result.mutate_reason})."
+                ),
+                nist_controls=SELF_PROTECT_CONTROLS,
+            )
+            return True, decision, [decision.reason]
+
+        # Denied or timed out.
+        self._log_tamper(
+            agent_id, tool_name, tool_args, result,
+            EVENT_TAMPER_DENIED, "deny",
+            code=approval.code,
+            approval_reason=approval.reason,
+        )
+        decision = Decision(
+            action="deny",
+            reason=(
+                f"Self-protection: mutation denied ({approval.reason}, "
+                f"code {approval.code})."
+            ),
+            nist_controls=SELF_PROTECT_CONTROLS,
+        )
+        return False, decision, [decision.reason]
+
+    def _log_tamper(
+        self,
+        agent_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        result,
+        event_type: str,
+        decision: str,
+        code: Optional[str] = None,
+        approval_reason: Optional[str] = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "path_hit": result.path_hit,
+            "arg_preview": result.arg_preview,
+            "kind": result.kind.value,
+        }
+        if result.mutate_reason:
+            payload["mutate_reason"] = result.mutate_reason
+        if code:
+            payload["approval_code"] = code
+        if approval_reason:
+            payload["approval_reason"] = approval_reason
+        self.audit_log.append_event(
+            AuditEvent(
+                agent_id=agent_id,
+                event_type=event_type,
+                tool_name=tool_name,
+                tool_args=payload,
+                decision=decision,
+                policy_matched="self_protection",
+                nist_controls=SELF_PROTECT_CONTROLS,
+            )
+        )
+
+    @staticmethod
+    def _preview_args(tool_name: str, tool_args: dict[str, Any]) -> str:
+        try:
+            flat = json.dumps(tool_args, sort_keys=True)
+        except Exception:
+            flat = str(tool_args)
+        return f"{tool_name} {flat}"[:300]
 
     def _log_tool_event(
         self,

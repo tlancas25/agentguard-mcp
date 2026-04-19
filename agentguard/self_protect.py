@@ -1,21 +1,25 @@
 """Self-protection for AgentGuard.
 
-Hard-coded, always-on path guard that prevents the protected agent from
-reaching into AgentGuard's own configuration, audit log, or signing keys
-through any MCP tool call.
+Scans every tool call for references to AgentGuard's own state
+(``~/.agentguard/`` plus any operator extras) and classifies each hit
+as a read or a mutation so the proxy can apply the right policy.
 
-The check runs BEFORE the policy engine and detector stack, so an
-attacker who has compromised the user's communication channel cannot
-instruct the agent to "delete ~/.agentguard/audit.db" or "unregister
-the AgentGuard MCP server" without the attempt being denied and
-permanently recorded in the hash-chained audit log.
+Three modes:
+  off       — classifier returns NONE for every call (feature disabled)
+  standard  — reads allowed (and logged); mutations held for operator approval
+  strict    — any reference denied
 
-This is a backstop. It does not replace OS-level filesystem isolation;
-a truly paranoid deployment still runs the gateway under its own service
-account with the audit directory chmod 600 and an immutable-bit offsite
-mirror.
+Threat model: the user's communication channel is compromised and the
+agent receives an instruction like "delete ~/.agentguard/audit.db" or
+"uninstall the AgentGuard MCP server". Without this guard the agent
+would gladly run those commands. With it, the attempt is either
+blocked outright (strict) or parked until a human approves via
+``agentguard approve <code>`` in a separate terminal (standard).
 
-NIST 800-53 controls addressed:
+Not a replacement for OS-level isolation — it's a backstop that turns
+a silent compromise into a loud, recorded one.
+
+NIST 800-53 controls:
 - AC-3  Access Enforcement
 - AU-9  Protection of Audit Information
 - SC-3  Security Function Isolation
@@ -27,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Iterable, Optional
 
 from agentguard.detectors.normalize import iter_strings, nfkc_stripped
@@ -34,16 +39,76 @@ from agentguard.detectors.normalize import iter_strings, nfkc_stripped
 NIST_CONTROLS = ["AC-3", "AU-9", "SC-3", "SI-7"]
 
 EVENT_TAMPER_ATTEMPT = "agentguard_tamper_attempt"
+EVENT_TAMPER_APPROVED = "agentguard_tamper_approved"
+EVENT_TAMPER_DENIED = "agentguard_tamper_denied"
+
+
+class ReferenceKind(str, Enum):
+    NONE = "none"
+    READ = "read"
+    MUTATE = "mutate"
 
 
 @dataclass
 class SelfProtectResult:
     """Outcome of a self-protection scan."""
 
-    matched: bool
+    kind: ReferenceKind
     path_hit: Optional[str] = None
     arg_preview: Optional[str] = None
-    reason: str = ""
+    mutate_reason: Optional[str] = None
+
+    @property
+    def matched(self) -> bool:
+        return self.kind is not ReferenceKind.NONE
+
+    @property
+    def is_mutate(self) -> bool:
+        return self.kind is ReferenceKind.MUTATE
+
+
+# Tool names that are inherently mutating regardless of argument content.
+# Direct file-writing / destructive surfaces with no read path.
+_MUTATING_TOOL_NAMES = {
+    "write_file", "write", "create_file", "edit_file", "patch_file",
+    "str_replace", "str_replace_editor", "append_file", "set_file_contents",
+    "delete_file", "rm_file", "remove_file", "unlink",
+    "move_file", "rename_file", "copy_file",
+    "fs_write", "fs_delete", "fs_mkdir", "fs_rmdir",
+}
+
+# Shells and generic command runners: classification is driven by the
+# content of the command string, not the tool name alone. A shell can
+# read or mutate; we defer to the mutate-pattern scan below.
+_SHELL_TOOL_NAMES = {
+    "run_shell", "shell_exec", "execute_command", "bash", "sh", "exec",
+    "terminal", "run_command",
+}
+
+# Regex patterns whose presence in tool args OR tool name promotes the
+# classification to MUTATE. Matched case-insensitively against the
+# NFKC-stripped form of every string argument.
+_MUTATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("rm",          re.compile(r"\b(?:rm|rmdir|del|rd)\b", re.IGNORECASE)),
+    ("mv",          re.compile(r"\b(?:mv|move|rename|rename-item)\b", re.IGNORECASE)),
+    ("cp_write",    re.compile(r"\b(?:cp|copy)\b", re.IGNORECASE)),
+    ("truncate",    re.compile(r"\btruncate\b|\btee\b", re.IGNORECASE)),
+    ("chmod",       re.compile(r"\b(?:chmod|chown|icacls|set-acl|takeown)\b", re.IGNORECASE)),
+    ("kill",        re.compile(r"\b(?:kill|pkill|killall|taskkill|stop-process)\b", re.IGNORECASE)),
+    ("mcp_remove",  re.compile(r"\bclaude\s+mcp\s+remove\b", re.IGNORECASE)),
+    ("ag_init_force", re.compile(r"\bagentguard\s+init\b[^\n]*--force", re.IGNORECASE)),
+    ("ag_update",   re.compile(r"\bagentguard\s+update\b(?![^\n]*--dry-run)", re.IGNORECASE)),
+    ("ag_repair",   re.compile(r"\bagentguard\s+repair\b(?![^\n]*--dry-run)", re.IGNORECASE)),
+    # Require SQL syntactic context to avoid matching bare 'update' in
+    # shell commands like 'agentguard update'.
+    ("sql_write",   re.compile(
+        r"\b(?:UPDATE\s+\w+\s+SET|DELETE\s+FROM|DROP\s+(?:TABLE|INDEX|DATABASE|VIEW)"
+        r"|INSERT\s+INTO|ALTER\s+TABLE|REPLACE\s+INTO)\b",
+        re.IGNORECASE,
+    )),
+    ("shell_write", re.compile(r"(?<![&|>])>{1,2}\s*[^&|]", re.IGNORECASE)),
+    ("write_api",   re.compile(r"\b(?:write_file|write_text|fs\.write|setfile|writefile)\b", re.IGNORECASE)),
+]
 
 
 def _normalize_path(p: str) -> str:
@@ -61,23 +126,17 @@ def _normalize_path(p: str) -> str:
 def default_protected_paths() -> list[str]:
     """Always-on protected set.
 
-    Deliberately narrow: only AgentGuard's own home directory.
-    Operators who want more coverage add paths via config
-    (self_protection.extra_paths) or AGENTGUARD_SELF_PROTECT_EXTRA_PATHS.
+    Deliberately narrow: only AgentGuard's own home directory. Operators
+    add extras via ``self_protection.extra_paths`` or
+    ``AGENTGUARD_SELF_PROTECT_EXTRA_PATHS``.
     """
-    # Import lazily to avoid a circular import with config.
     from agentguard.config import DEFAULT_AGENTGUARD_HOME
 
     return [_normalize_path(str(DEFAULT_AGENTGUARD_HOME))]
 
 
 def _path_hit(candidate: str, needle: str) -> bool:
-    """Does the tool-call string contain a reference to the protected path?
-
-    Uses both a normalized startswith check (exact path or a child of it)
-    and a substring check on the normalized forms so URL-encoded or
-    concatenated forms still trip the guard.
-    """
+    """Does the tool-call string reference the protected path?"""
     norm_c = _normalize_path(candidate)
     if not norm_c or not needle:
         return False
@@ -85,41 +144,86 @@ def _path_hit(candidate: str, needle: str) -> bool:
         return True
     if norm_c.startswith(needle + "/"):
         return True
-    # Substring catch: an attacker might embed the path inside a larger
-    # payload like "rm -rf ~/.agentguard/ && ...". Use the needle as a
-    # bare substring to catch that.
     return needle in norm_c
 
 
-def scan_tool_call(
+def _detect_mutation(tool_name: str, candidates: list[str]) -> Optional[str]:
+    """Return the name of the first mutation signal found, else None."""
+    tn = (tool_name or "").lower()
+    # Direct-write tool names are always mutations.
+    if tn in _MUTATING_TOOL_NAMES:
+        return f"tool_name:{tool_name}"
+    # For shells and generic runners, look at the command text itself —
+    # many legitimate reads (cat, ls, --dry-run) are shells too.
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        for label, pat in _MUTATE_PATTERNS:
+            if pat.search(raw):
+                return label
+    return None
+
+
+def classify_self_reference(
     tool_name: str,
     tool_args: dict[str, Any],
     extra_paths: Optional[Iterable[str]] = None,
 ) -> SelfProtectResult:
-    """Return matched=True if tool_name or any nested string arg references
-    a protected path."""
+    """Return how a tool call relates to AgentGuard-protected paths.
+
+    ReferenceKind.NONE    — the call does not reference any protected path.
+    ReferenceKind.READ    — protected path referenced, no mutation signals.
+    ReferenceKind.MUTATE  — protected path referenced AND mutation signals
+                            present (destructive tool name, denylist regex,
+                            or SQL write verb).
+    """
     protected = list(default_protected_paths())
     if extra_paths:
         for extra in extra_paths:
             if extra:
                 protected.append(_normalize_path(extra))
-    # De-dupe while preserving order.
     protected = list(dict.fromkeys(p for p in protected if p))
 
     candidates: list[str] = [tool_name] if isinstance(tool_name, str) else []
     candidates.extend(s for s in iter_strings(tool_args) if isinstance(s, str))
 
+    # 1. Any protected-path hit?
+    path_hit: Optional[str] = None
+    offending_arg: Optional[str] = None
     for raw in candidates:
         normalized_candidate = nfkc_stripped(raw)
         for needle in protected:
             if _path_hit(normalized_candidate, needle):
-                return SelfProtectResult(
-                    matched=True,
-                    path_hit=needle,
-                    arg_preview=raw[:120],
-                    reason=(
-                        f"Tool call references AgentGuard-protected path "
-                        f"'{needle}'. Deny by self-protection."
-                    ),
-                )
-    return SelfProtectResult(matched=False)
+                path_hit = needle
+                offending_arg = raw
+                break
+        if path_hit:
+            break
+
+    if path_hit is None:
+        return SelfProtectResult(kind=ReferenceKind.NONE)
+
+    # 2. Classify: mutation or read?
+    mutation = _detect_mutation(tool_name, candidates)
+    if mutation is not None:
+        return SelfProtectResult(
+            kind=ReferenceKind.MUTATE,
+            path_hit=path_hit,
+            arg_preview=(offending_arg or "")[:120],
+            mutate_reason=mutation,
+        )
+    return SelfProtectResult(
+        kind=ReferenceKind.READ,
+        path_hit=path_hit,
+        arg_preview=(offending_arg or "")[:120],
+    )
+
+
+# Backwards-compatible alias kept for the earlier all-or-nothing callers.
+# Returns matched=True whenever kind != NONE.
+def scan_tool_call(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    extra_paths: Optional[Iterable[str]] = None,
+) -> SelfProtectResult:
+    return classify_self_reference(tool_name, tool_args, extra_paths)

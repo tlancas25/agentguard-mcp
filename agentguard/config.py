@@ -61,11 +61,23 @@ class DetectorsConfig(BaseModel):
 class SelfProtectionConfig(BaseModel):
     """Configuration for AgentGuard's self-tamper guard.
 
-    The always-on default (AgentGuard home directory) cannot be disabled.
-    Operators may add additional paths to harden further.
+    Three modes are offered so the operator can choose the right posture:
+
+    - ``off``       (default) no guarding. The agent can read, modify, or
+                    stop AgentGuard freely. Dev convenience.
+    - ``standard``  reads of AgentGuard state are allowed and logged;
+                    mutations require operator approval via
+                    ``agentguard approve <code>``.
+    - ``strict``    any reference to a protected path — read or write —
+                    is denied outright.
+
+    Regardless of mode, every denied or approved attempt is recorded in
+    the hash-chained audit log.
     """
 
+    mode: Literal["off", "standard", "strict"] = "off"
     extra_paths: list[str] = Field(default_factory=list)
+    approval_timeout_seconds: int = 60
 
 
 class FederalConfig(BaseModel):
@@ -162,6 +174,12 @@ class AgentGuardConfig(BaseModel):
             sp_data["extra_paths"] = [
                 p.strip() for p in env_extra_sp.split(",") if p.strip()
             ]
+            data["self_protection"] = sp_data
+
+        env_sp_mode = os.environ.get("AGENTGUARD_SELF_PROTECT_MODE")
+        if env_sp_mode:
+            sp_data = data.get("self_protection", {}) or {}
+            sp_data["mode"] = env_sp_mode
             data["self_protection"] = sp_data
 
         # Federal mode env overrides

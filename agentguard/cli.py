@@ -48,6 +48,19 @@ def _resolve_config_path(config_path: str) -> Path:
     return explicit
 
 
+def _set_self_protection_mode_in_yaml(yaml_path: Path, mode: str) -> None:
+    """Rewrite self_protection.mode in-place without disturbing other keys."""
+    import yaml as _yaml
+
+    with open(yaml_path) as f:
+        data = _yaml.safe_load(f) or {}
+    sp = data.get("self_protection") or {}
+    sp["mode"] = mode
+    data["self_protection"] = sp
+    with open(yaml_path, "w") as f:
+        _yaml.safe_dump(data, f, sort_keys=False)
+
+
 def _load_config(config_path: str, mode: Optional[str] = None) -> "AgentGuardConfig":  # type: ignore[name-defined]
     """Load config from file + env, with optional mode override."""
     from agentguard.config import AgentGuardConfig
@@ -82,7 +95,26 @@ def cli() -> None:
     default=False,
     help="Scaffold in the current directory instead of ~/.agentguard/.",
 )
-def init(gen_key: bool, force: bool, local: bool) -> None:
+@click.option(
+    "--self-protect",
+    "self_protect_mode",
+    type=click.Choice(["off", "standard", "strict"]),
+    default=None,
+    help="Self-protection mode. If omitted, an interactive prompt asks.",
+)
+@click.option(
+    "--no-interactive",
+    is_flag=True,
+    default=False,
+    help="Skip the wizard; use defaults (self_protect=off) for scripted installs.",
+)
+def init(
+    gen_key: bool,
+    force: bool,
+    local: bool,
+    self_protect_mode: Optional[str],
+    no_interactive: bool,
+) -> None:
     """Scaffold agentguard.yaml.
 
     By default the config and audit DB live under ``~/.agentguard/`` so the
@@ -119,11 +151,44 @@ def init(gen_key: bool, force: bool, local: bool) -> None:
         )
         console.print(f"[green]Created minimal {dest}[/green]")
 
+    # Self-protection prompt / flag
+    sp_mode = self_protect_mode
+    if sp_mode is None:
+        if no_interactive or not sys.stdin.isatty():
+            sp_mode = "off"
+            console.print(
+                "[dim]Self-protection: [bold]off[/bold] "
+                "(non-interactive install; use --self-protect standard|strict to change)[/dim]"
+            )
+        else:
+            console.print(
+                "\n[bold]Self-protection[/bold]\n"
+                "Controls whether agents can modify or stop AgentGuard itself.\n"
+                "  [1] [bold]Off[/bold]      — agent has full access (DEFAULT)\n"
+                "  [2] Standard — reads logged; mutations need operator approval\n"
+                "  [3] Strict   — any reference to ~/.agentguard/ denied outright"
+            )
+            choice = click.prompt(
+                "Pick a self-protection mode", default="1",
+                show_default=True, type=click.Choice(["1", "2", "3"]),
+            )
+            sp_mode = {"1": "off", "2": "standard", "3": "strict"}[choice]
+            console.print(f"[green]Self-protection: {sp_mode}[/green]")
+
+    # Patch the YAML if the chosen mode isn't the default off.
+    if sp_mode != "off":
+        _set_self_protection_mode_in_yaml(dest, sp_mode)
+
     console.print(
         f"[dim]Audit DB will be written to "
         f"[bold]{DEFAULT_AGENTGUARD_HOME / 'audit.db'}[/bold] "
         f"unless you change audit_db_path in the YAML.[/dim]"
     )
+    if sp_mode == "standard":
+        console.print(
+            "[dim]Approve pending mutations with: "
+            "[bold]agentguard approve <code>[/bold][/dim]"
+        )
 
     if gen_key:
         from agentguard.audit_log import generate_signing_keypair
@@ -434,6 +499,67 @@ def policy_check(file: str, mode: str) -> None:
         sys.exit(1)
     else:
         console.print(f"[bold green]Policy file is valid:[/bold green] {file}")
+
+
+@cli.command()
+@click.argument("code", required=False)
+@click.option(
+    "--deny",
+    is_flag=True,
+    default=False,
+    help="Deny the request instead of approving it.",
+)
+def approve(code: Optional[str], deny: bool) -> None:
+    """Approve or deny a pending self-protection mutation.
+
+    Run without arguments to list every pending request. Run with a
+    code to resolve it. Use ``--deny`` to explicitly reject.
+    """
+    from agentguard.approvals import ApprovalManager, default_approvals_dir
+    import time as _time
+
+    mgr = ApprovalManager(default_approvals_dir())
+
+    if not code:
+        pending = mgr.list_pending()
+        now = _time.time()
+        if not pending:
+            console.print("[dim]No pending AgentGuard approvals.[/dim]")
+            return
+        table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+        table.add_column("Code", width=8)
+        table.add_column("Agent", width=30)
+        table.add_column("Tool", width=18)
+        table.add_column("Path hit", width=30)
+        table.add_column("Seconds left", justify="right")
+        for p in pending:
+            remaining = max(0, int(p.get("expires_at", now) - now))
+            table.add_row(
+                str(p.get("code", "")),
+                str(p.get("agent_id", ""))[:30],
+                str(p.get("tool_name", ""))[:18],
+                str(p.get("path_hit", ""))[:30],
+                str(remaining),
+            )
+        console.print(table)
+        console.print(
+            "[dim]To resolve: agentguard approve <code>  "
+            "(add --deny to reject)[/dim]"
+        )
+        return
+
+    if deny:
+        if mgr.deny(code):
+            console.print(f"[yellow]Denied approval for code {code}.[/yellow]")
+        else:
+            err_console.print(f"[red]No pending request with code {code}.[/red]")
+            sys.exit(1)
+    else:
+        if mgr.approve(code):
+            console.print(f"[green]Approved code {code}.[/green]")
+        else:
+            err_console.print(f"[red]No pending request with code {code}.[/red]")
+            sys.exit(1)
 
 
 @cli.command()
