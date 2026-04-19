@@ -103,6 +103,67 @@ class TestClassifier:
         assert r.kind is ReferenceKind.MUTATE
 
 
+class TestBareSelfCommands:
+    """Bare AgentGuard mutation commands that never name the protected path.
+
+    These must be classified MUTATE purely on command identity, or a
+    compromised agent can reinstall / reconfigure / self-approve the
+    gateway without tripping the guard.
+    """
+
+    def test_bare_agentguard_update(self) -> None:
+        r = classify_self_reference("shell_exec", {"cmd": "agentguard update"})
+        assert r.kind is ReferenceKind.MUTATE
+        assert r.mutate_reason == "ag_update"
+
+    def test_bare_agentguard_update_dry_run_is_none(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "agentguard update --dry-run"}
+        )
+        assert r.kind is ReferenceKind.NONE
+
+    def test_bare_agentguard_repair(self) -> None:
+        r = classify_self_reference("shell_exec", {"cmd": "agentguard repair"})
+        assert r.kind is ReferenceKind.MUTATE
+
+    def test_bare_claude_mcp_remove_agentguard(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "claude mcp remove agentguard"}
+        )
+        assert r.kind is ReferenceKind.MUTATE
+
+    def test_bare_claude_mcp_remove_other_is_none(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "claude mcp remove some-other-server"}
+        )
+        assert r.kind is ReferenceKind.NONE
+
+    def test_bare_agentguard_approve_is_mutate(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "agentguard approve 123456"}
+        )
+        assert r.kind is ReferenceKind.MUTATE
+        assert r.mutate_reason == "ag_approve"
+
+    def test_bare_agentguard_init_force(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "agentguard init --force"}
+        )
+        assert r.kind is ReferenceKind.MUTATE
+
+    def test_kill_agentguard_is_mutate(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "taskkill /F /IM agentguard.exe"}
+        )
+        assert r.kind is ReferenceKind.MUTATE
+
+    def test_generic_kill_is_none(self) -> None:
+        r = classify_self_reference(
+            "shell_exec", {"cmd": "kill -9 1234"}
+        )
+        assert r.kind is ReferenceKind.NONE
+
+
 # ---------------------------------------------------------------------------
 # Mode integration
 # ---------------------------------------------------------------------------
@@ -218,3 +279,25 @@ class TestApprovalManager:
         assert mgr.approve("123456") is True
         assert (tmp_path / "123456.approved").exists()
         assert mgr.approve("999999") is False
+
+    @pytest.mark.parametrize(
+        "bad_code",
+        [
+            "",
+            "abcdef",
+            "12345",
+            "1234567",
+            "../foo",
+            "123/45",
+            "1 2 3 4 5 6",
+            "%20%20%20",
+        ],
+    )
+    def test_approve_rejects_malformed_codes(
+        self, tmp_path: Path, bad_code: str
+    ) -> None:
+        mgr = ApprovalManager(tmp_path)
+        assert mgr.approve(bad_code) is False
+        assert mgr.deny(bad_code) is False
+        # Nothing should have been written into the directory.
+        assert list(tmp_path.iterdir()) == []

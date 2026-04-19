@@ -300,7 +300,7 @@ all with NIST controls `AC-3`, `AU-9`, `SC-3`, `SI-7`.
 
 1. The agent sends a mutation like `shell_exec: rm -rf ~/.agentguard/audit.db`.
 2. AgentGuard classifies the call as a mutation, parks it, writes a `.pending.json` file to `~/.agentguard/approvals/`, and prints a banner to its stderr:
-   ```
+   ```text
    ============================================================
      AGENTGUARD APPROVAL REQUIRED
    ============================================================
@@ -332,6 +332,8 @@ Env var overrides (handy for Docker / systemd):
 ```bash
 export AGENTGUARD_SELF_PROTECT_MODE=standard
 export AGENTGUARD_SELF_PROTECT_EXTRA_PATHS="/etc/agentguard,/var/log/agentguard"
+# Point the approval channel at a non-default directory (containers, tests).
+export AGENTGUARD_APPROVALS_DIR="$HOME/.agentguard/approvals"
 ```
 
 ### What this is *not*

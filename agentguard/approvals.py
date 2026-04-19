@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import time
@@ -27,6 +28,11 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SEC = 0.25
+# Approval codes are always 6 ASCII digits. Validate before any code
+# flows into a filename so a compromised caller can't inject ../../
+# or absolute paths.
+CODE_RE = re.compile(r"^\d{6}$")
+MAX_CODE_GENERATION_ATTEMPTS = 10
 
 
 @dataclass
@@ -47,7 +53,13 @@ class ApprovalManager:
 
     def __init__(self, approvals_dir: Path) -> None:
         self.dir = approvals_dir
-        self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # mkdir(mode=) respects umask on POSIX; chmod after to guarantee
+        # 0o700 regardless of the caller's environment. No-op on Windows.
+        try:
+            os.chmod(self.dir, 0o700)
+        except OSError as e:
+            logger.debug("Could not chmod approval dir %s: %s", self.dir, e)
 
     def request(
         self,
@@ -59,15 +71,36 @@ class ApprovalManager:
         timeout_seconds: int = 60,
     ) -> ApprovalResult:
         """Publish a request, block until resolved or timed out."""
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        pending_path = self.dir / f"{code}.pending.json"
-        approved_path = self.dir / f"{code}.approved"
-        denied_path = self.dir / f"{code}.denied"
         created_at = time.time()
         expires_at = created_at + timeout_seconds
 
-        pending_path.write_text(
-            json.dumps(
+        # Generate a non-colliding 6-digit code and atomically create the
+        # pending file. O_CREAT|O_EXCL prevents an attacker who can guess
+        # a code from racing to pre-create the file.
+        code = ""
+        pending_path: Optional[Path] = None
+        for _ in range(MAX_CODE_GENERATION_ATTEMPTS):
+            candidate = f"{secrets.randbelow(1_000_000):06d}"
+            candidate_path = self.dir / f"{candidate}.pending.json"
+            approved_probe = self.dir / f"{candidate}.approved"
+            denied_probe = self.dir / f"{candidate}.denied"
+            if (
+                candidate_path.exists()
+                or approved_probe.exists()
+                or denied_probe.exists()
+            ):
+                continue
+            try:
+                fd = os.open(
+                    str(candidate_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+            except FileExistsError:
+                continue
+            code = candidate
+            pending_path = candidate_path
+            body = json.dumps(
                 {
                     "code": code,
                     "agent_id": agent_id,
@@ -80,7 +113,22 @@ class ApprovalManager:
                 },
                 indent=2,
             )
-        )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+            try:
+                os.chmod(pending_path, 0o600)
+            except OSError as e:
+                logger.debug("Could not chmod pending approval %s: %s", pending_path, e)
+            break
+        else:
+            logger.error(
+                "Could not allocate an approval code after %d attempts.",
+                MAX_CODE_GENERATION_ATTEMPTS,
+            )
+            return ApprovalResult(approved=False, code="", reason="code_collision")
+
+        approved_path = self.dir / f"{code}.approved"
+        denied_path = self.dir / f"{code}.denied"
 
         self._print_banner(
             code=code,
@@ -108,18 +156,32 @@ class ApprovalManager:
 
     def approve(self, code: str) -> bool:
         """Approve a pending request. Returns True if a matching request exists."""
+        if not CODE_RE.fullmatch(code or ""):
+            return False
         pending = self.dir / f"{code}.pending.json"
         if not pending.exists():
             return False
-        (self.dir / f"{code}.approved").write_text("")
+        sentinel = self.dir / f"{code}.approved"
+        sentinel.write_text("", encoding="utf-8")
+        try:
+            os.chmod(sentinel, 0o600)
+        except OSError as e:
+            logger.debug("Could not chmod approval sentinel %s: %s", sentinel, e)
         return True
 
     def deny(self, code: str) -> bool:
         """Deny a pending request. Returns True if a matching request exists."""
+        if not CODE_RE.fullmatch(code or ""):
+            return False
         pending = self.dir / f"{code}.pending.json"
         if not pending.exists():
             return False
-        (self.dir / f"{code}.denied").write_text("")
+        sentinel = self.dir / f"{code}.denied"
+        sentinel.write_text("", encoding="utf-8")
+        try:
+            os.chmod(sentinel, 0o600)
+        except OSError as e:
+            logger.debug("Could not chmod denial sentinel %s: %s", sentinel, e)
         return True
 
     def list_pending(self) -> list[dict[str, Any]]:

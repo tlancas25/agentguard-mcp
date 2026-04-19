@@ -88,6 +88,8 @@ _SHELL_TOOL_NAMES = {
 # Regex patterns whose presence in tool args OR tool name promotes the
 # classification to MUTATE. Matched case-insensitively against the
 # NFKC-stripped form of every string argument.
+# Generic mutation patterns. These require a protected-path hit to be
+# meaningful — "rm /tmp/foo" is not self-tampering.
 _MUTATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("rm",          re.compile(r"\b(?:rm|rmdir|del|rd)\b", re.IGNORECASE)),
     ("mv",          re.compile(r"\b(?:mv|move|rename|rename-item)\b", re.IGNORECASE)),
@@ -95,10 +97,6 @@ _MUTATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("truncate",    re.compile(r"\btruncate\b|\btee\b", re.IGNORECASE)),
     ("chmod",       re.compile(r"\b(?:chmod|chown|icacls|set-acl|takeown)\b", re.IGNORECASE)),
     ("kill",        re.compile(r"\b(?:kill|pkill|killall|taskkill|stop-process)\b", re.IGNORECASE)),
-    ("mcp_remove",  re.compile(r"\bclaude\s+mcp\s+remove\b", re.IGNORECASE)),
-    ("ag_init_force", re.compile(r"\bagentguard\s+init\b[^\n]*--force", re.IGNORECASE)),
-    ("ag_update",   re.compile(r"\bagentguard\s+update\b(?![^\n]*--dry-run)", re.IGNORECASE)),
-    ("ag_repair",   re.compile(r"\bagentguard\s+repair\b(?![^\n]*--dry-run)", re.IGNORECASE)),
     # Require SQL syntactic context to avoid matching bare 'update' in
     # shell commands like 'agentguard update'.
     ("sql_write",   re.compile(
@@ -108,6 +106,32 @@ _MUTATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     )),
     ("shell_write", re.compile(r"(?<![&|>])>{1,2}\s*[^&|]", re.IGNORECASE)),
     ("write_api",   re.compile(r"\b(?:write_file|write_text|fs\.write|setfile|writefile)\b", re.IGNORECASE)),
+]
+
+# Self-command patterns. These mutate AgentGuard state by identity alone,
+# even when the command text never names the protected path. A bare
+# `agentguard update` or `claude mcp remove agentguard` will happily
+# remove the gateway without mentioning ``~/.agentguard/`` — so these
+# must fire independently of path matching.
+_SELF_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("mcp_remove_agentguard",
+     re.compile(r"\bclaude\s+mcp\s+remove\s+agentguard\b", re.IGNORECASE)),
+    ("ag_init_force",
+     re.compile(r"\bagentguard\s+init\b[^\n]*--force", re.IGNORECASE)),
+    ("ag_update",
+     re.compile(r"\bagentguard\s+update\b(?![^\n]*--dry-run)", re.IGNORECASE)),
+    ("ag_repair",
+     re.compile(r"\bagentguard\s+repair\b(?![^\n]*--dry-run)", re.IGNORECASE)),
+    # Agents must never approve their own pending mutations; that would
+    # turn a compromise into instant self-authorization.
+    ("ag_approve",
+     re.compile(r"\bagentguard\s+approve\b", re.IGNORECASE)),
+    # Kill targeted at AgentGuard process names specifically.
+    ("kill_agentguard",
+     re.compile(
+         r"\b(?:kill|pkill|killall|taskkill|stop-process)\b[^\n]*\bagentguard\b",
+         re.IGNORECASE,
+     )),
 ]
 
 
@@ -154,12 +178,32 @@ def _detect_mutation(tool_name: str, candidates: list[str]) -> Optional[str]:
     if tn in _MUTATING_TOOL_NAMES:
         return f"tool_name:{tool_name}"
     # For shells and generic runners, look at the command text itself —
-    # many legitimate reads (cat, ls, --dry-run) are shells too.
+    # many legitimate reads (cat, ls, --dry-run) are shells too. Use the
+    # same NFKC-stripped form so unicode evasion can't dodge the regex.
     for raw in candidates:
         if not isinstance(raw, str):
             continue
+        normalized = nfkc_stripped(raw)
         for label, pat in _MUTATE_PATTERNS:
-            if pat.search(raw):
+            if pat.search(normalized):
+                return label
+    return None
+
+
+def _detect_self_command(candidates: list[str]) -> Optional[str]:
+    """Detect AgentGuard-specific mutation commands independent of path.
+
+    These are always treated as MUTATE because they modify gateway state
+    by identity alone (reinstall, reconfigure, remove registration,
+    self-approve, kill process), even when the command string never
+    mentions the protected directory.
+    """
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        normalized = nfkc_stripped(raw)
+        for label, pat in _SELF_COMMAND_PATTERNS:
+            if pat.search(normalized):
                 return label
     return None
 
@@ -186,6 +230,19 @@ def classify_self_reference(
 
     candidates: list[str] = [tool_name] if isinstance(tool_name, str) else []
     candidates.extend(s for s in iter_strings(tool_args) if isinstance(s, str))
+
+    # 0. Self-command? Fires even when the call does not name a path.
+    self_command = _detect_self_command(candidates)
+    if self_command is not None:
+        preview = next(
+            (c for c in candidates if isinstance(c, str) and c), ""
+        )
+        return SelfProtectResult(
+            kind=ReferenceKind.MUTATE,
+            path_hit=protected[0] if protected else None,
+            arg_preview=preview[:120],
+            mutate_reason=self_command,
+        )
 
     # 1. Any protected-path hit?
     path_hit: Optional[str] = None
