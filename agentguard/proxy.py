@@ -35,6 +35,11 @@ from agentguard.nist.mappings import (
     get_controls_for_event,
 )
 from agentguard.policy_engine import Decision, PolicyEngine
+from agentguard.self_protect import (
+    EVENT_TAMPER_ATTEMPT,
+    NIST_CONTROLS as SELF_PROTECT_CONTROLS,
+    scan_tool_call as scan_self_protect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +129,41 @@ class ProxyCore:
         agent_id = self._get_agent_id()
         warnings: list[str] = []
 
+        # Self-protection: always-on, runs BEFORE detectors/policy so an
+        # attacker who has compromised the user channel cannot instruct
+        # the agent to disable or tamper with the gateway. The attempt
+        # is denied and recorded immutably in the hash-chained audit log.
+        sp = scan_self_protect(
+            tool_name, tool_args, self.config.self_protection.extra_paths
+        )
+        if sp.matched:
+            decision = Decision(
+                action="deny",
+                reason=sp.reason,
+                nist_controls=SELF_PROTECT_CONTROLS,
+            )
+            self.audit_log.append_event(
+                AuditEvent(
+                    agent_id=agent_id,
+                    event_type=EVENT_TAMPER_ATTEMPT,
+                    tool_name=tool_name,
+                    tool_args={
+                        "path_hit": sp.path_hit,
+                        "arg_preview": sp.arg_preview,
+                    },
+                    decision="deny",
+                    policy_matched="self_protection",
+                    nist_controls=SELF_PROTECT_CONTROLS,
+                )
+            )
+            logger.warning(
+                "[AgentGuard] Tamper attempt blocked: %s (tool=%s)",
+                sp.reason,
+                tool_name,
+            )
+            warnings.append(sp.reason)
+            return False, decision, warnings
+
         # Run detector stack
         detection_controls: list[str] = []
 
@@ -198,7 +238,7 @@ class ProxyCore:
 
         if self.config.detectors.secrets.enabled:
             from agentguard.detectors.secrets import detect_in_tool_args as detect_secrets
-            sec = detect_in_tool_args(tool_args)
+            sec = detect_secrets(tool_args)
             if sec.matched:
                 detection_controls.extend(sec.nist_controls)
                 warnings.append(f"Secret detected: {', '.join(sec.types_found)}")
@@ -255,6 +295,33 @@ class ProxyCore:
     def handle_resources_read(self, uri: str, extra_args: dict[str, Any]) -> bool:
         """Log a resources/read request. Returns True if allowed."""
         agent_id = self._get_agent_id()
+
+        sp = scan_self_protect(
+            "resources/read",
+            {"uri": uri, **extra_args},
+            self.config.self_protection.extra_paths,
+        )
+        if sp.matched:
+            self.audit_log.append_event(
+                AuditEvent(
+                    agent_id=agent_id,
+                    event_type=EVENT_TAMPER_ATTEMPT,
+                    tool_name="resources/read",
+                    tool_args={
+                        "uri": uri,
+                        "path_hit": sp.path_hit,
+                        "arg_preview": sp.arg_preview,
+                    },
+                    decision="deny",
+                    policy_matched="self_protection",
+                    nist_controls=SELF_PROTECT_CONTROLS,
+                )
+            )
+            logger.warning(
+                "[AgentGuard] Resource read tamper attempt blocked: %s", sp.reason
+            )
+            return False
+
         decision = self.policy_engine.evaluate("resources/read", {"uri": uri}, agent_id)
         self.audit_log.append_event(
             AuditEvent(

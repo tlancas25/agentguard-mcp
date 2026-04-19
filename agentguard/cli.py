@@ -436,6 +436,156 @@ def policy_check(file: str, mode: str) -> None:
         console.print(f"[bold green]Policy file is valid:[/bold green] {file}")
 
 
+@cli.command()
+@click.option(
+    "--ref",
+    default=None,
+    help="Git ref (tag or SHA) to install. Defaults to latest main.",
+)
+@click.option(
+    "--repo",
+    default="tlancas25/agentguard-mcp",
+    show_default=True,
+    help="GitHub repo slug to install from.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print the install command without executing.",
+)
+def update(ref: Optional[str], repo: str, dry_run: bool) -> None:
+    """Re-install AgentGuard from GitHub in place.
+
+    Detects whether the current install is managed by uv tool or pip and
+    runs the matching reinstall command. Use ``--ref v0.2.0`` to pin a
+    specific release tag or commit SHA.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    ref = ref or "main"
+    git_url = f"git+https://github.com/{repo}.git@{ref}"
+
+    uv_available = _shutil.which("uv") is not None
+    if uv_available:
+        cmd = [
+            "uv", "tool", "install", "--force", "--reinstall",
+            "--python", "3.11", git_url,
+        ]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "-U", git_url]
+
+    console.print(f"[bold]Update plan:[/bold] {' '.join(cmd)}")
+    if dry_run:
+        console.print("[yellow]--dry-run set; not executing.[/yellow]")
+        return
+
+    proc = subprocess.run(cmd, check=False)
+    if proc.returncode != 0:
+        err_console.print(
+            f"[bold red]Update failed[/bold red] (exit {proc.returncode})"
+        )
+        sys.exit(proc.returncode)
+    console.print(f"[green]AgentGuard updated from {ref}.[/green]")
+    console.print(
+        "[dim]Restart Claude Code (or any MCP client) to pick up the new version.[/dim]"
+    )
+
+
+@cli.command()
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report problems without making changes.",
+)
+def repair(dry_run: bool) -> None:
+    """Diagnose and repair a local AgentGuard install.
+
+    Checks the user home directory, default config, audit DB parent dir,
+    and hash-chain integrity. Fixes what it can. Exits non-zero if any
+    issue is unresolvable without operator input.
+    """
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME, DEFAULT_CONFIG_PATH
+
+    problems: list[str] = []
+    fixed: list[str] = []
+
+    def _fix(msg: str, do: callable) -> None:  # type: ignore[valid-type]
+        if dry_run:
+            problems.append(f"{msg} [would fix]")
+            return
+        try:
+            do()
+            fixed.append(msg)
+        except Exception as e:
+            problems.append(f"{msg} [fix failed: {e}]")
+
+    # 1) home dir
+    if not DEFAULT_AGENTGUARD_HOME.exists():
+        _fix(
+            f"Create {DEFAULT_AGENTGUARD_HOME}",
+            lambda: DEFAULT_AGENTGUARD_HOME.mkdir(parents=True, exist_ok=True),
+        )
+    else:
+        fixed.append(f"{DEFAULT_AGENTGUARD_HOME} exists")
+
+    # 2) default config
+    if not DEFAULT_CONFIG_PATH.exists():
+        def _scaffold() -> None:
+            example = Path(__file__).parent.parent / "agentguard.yaml.example"
+            if example.exists():
+                shutil.copy(example, DEFAULT_CONFIG_PATH)
+            else:
+                DEFAULT_CONFIG_PATH.write_text(
+                    "mode: dev\n"
+                    "audit_db_path: ~/.agentguard/audit.db\n"
+                    "policy_bundles: []\n"
+                    "upstream_servers: []\n"
+                )
+        _fix(f"Scaffold {DEFAULT_CONFIG_PATH}", _scaffold)
+    else:
+        fixed.append(f"{DEFAULT_CONFIG_PATH} exists")
+
+    # 3) audit DB parent + integrity check
+    try:
+        cfg = _load_config(str(DEFAULT_CONFIG_PATH))
+        audit_parent = Path(cfg.audit_db_path).parent
+        if not audit_parent.exists():
+            _fix(
+                f"Create {audit_parent}",
+                lambda: audit_parent.mkdir(parents=True, exist_ok=True),
+            )
+
+        from agentguard.audit_log import AuditLog
+        log = AuditLog(db_path=cfg.audit_db_path)
+        valid, msg = log.verify_chain()
+        if valid:
+            fixed.append(f"audit chain verified: {msg}")
+        else:
+            problems.append(f"audit chain broken: {msg}")
+    except Exception as e:
+        problems.append(f"could not load config / audit log: {e}")
+
+    # 4) binary self-test
+    try:
+        import agentguard
+        fixed.append(f"agentguard package importable (v{agentguard.__version__})")
+    except Exception as e:
+        problems.append(f"agentguard package not importable: {e}")
+
+    # Report
+    for item in fixed:
+        console.print(f"  [green]OK[/green]  {item}")
+    for item in problems:
+        err_console.print(f"  [red]FAIL[/red]  {item}")
+
+    if problems:
+        sys.exit(1)
+    console.print(f"[bold green]Repair complete.[/bold green] {len(fixed)} checks passed.")
+
+
 @cli.command(
     context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
 )

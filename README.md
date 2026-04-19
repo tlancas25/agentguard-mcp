@@ -47,6 +47,8 @@ Each installer detects your platform, installs [uv](https://github.com/astral-sh
   - [Add to Claude Code](#add-to-claude-code)
 - [Where AgentGuard stores data](#where-agentguard-stores-data)
 - [Reading the audit log](#reading-the-audit-log)
+- [Self-protection](#self-protection)
+- [Maintenance commands](#maintenance-commands)
 - [Architecture](#architecture)
 - [Compatibility](#compatibility)
 - [Defensible Claims](#defensible-claims)
@@ -271,6 +273,45 @@ agentguard audit export --format csv --output ~/audit-evidence.csv
 ```
 
 **Rotating the log:** AgentGuard does not rotate the SQLite file. For long-running deployments, script a periodic export + `VACUUM` + truncate workflow, or copy the DB off-host to a SIEM before archiving.
+
+---
+
+## Self-protection
+
+AgentGuard is the thing your AI agent is supposed to obey. If the user's communication channel is compromised (prompt injection, a spoofed terminal, a malicious document the agent is reading), the attacker's next move is usually to tell the agent to disable the guard — "delete `~/.agentguard/audit.db`", "uninstall the MCP server", "overwrite the signing key".
+
+Every tool call is pre-screened for references to AgentGuard's own state. If a call touches the protected directory, it is **denied before the policy engine or detectors run** and the attempt is written to the hash-chained audit log under event type `agentguard_tamper_attempt` with NIST controls `AC-3`, `AU-9`, `SC-3`, `SI-7`.
+
+**Protected by default (always on, both modes):**
+- `~/.agentguard/` (config, audit DB, signing keys)
+
+**Extend via YAML or env var:**
+```yaml
+self_protection:
+  extra_paths:
+    - /etc/agentguard
+    - /var/log/agentguard
+```
+```bash
+export AGENTGUARD_SELF_PROTECT_EXTRA_PATHS="/etc/agentguard,/var/log/agentguard"
+```
+
+**What this is not:** a replacement for OS-level isolation. A truly paranoid deployment still runs AgentGuard under a dedicated service account, `chmod 600` the DB, and ships an offsite mirror of the audit log. Self-protection is a backstop that turns a silent compromise into a loud, recorded one.
+
+---
+
+## Maintenance commands
+
+```bash
+agentguard help [command...]    # full help tree
+agentguard version              # print version + python
+agentguard repair [--dry-run]   # diagnose + fix a local install
+agentguard update [--ref TAG]   # reinstall from GitHub (uv tool or pip)
+```
+
+`repair` checks for the home directory, default config, audit DB parent, hash-chain integrity, and package importability. Without `--dry-run` it creates anything missing.
+
+`update` detects whether the install was managed by `uv tool install` or `pip` and runs the correct reinstall. Pin a specific release with `agentguard update --ref v0.2.0`.
 
 ---
 

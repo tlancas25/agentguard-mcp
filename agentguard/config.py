@@ -58,6 +58,16 @@ class DetectorsConfig(BaseModel):
     )
 
 
+class SelfProtectionConfig(BaseModel):
+    """Configuration for AgentGuard's self-tamper guard.
+
+    The always-on default (AgentGuard home directory) cannot be disabled.
+    Operators may add additional paths to harden further.
+    """
+
+    extra_paths: list[str] = Field(default_factory=list)
+
+
 class FederalConfig(BaseModel):
     """Federal-mode-specific configuration."""
 
@@ -83,6 +93,7 @@ class AgentGuardConfig(BaseModel):
     policy_bundles: list[str] = Field(default_factory=list)
     detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
     federal: FederalConfig = Field(default_factory=FederalConfig)
+    self_protection: SelfProtectionConfig = Field(default_factory=SelfProtectionConfig)
 
     @field_validator("audit_db_path", mode="before")
     @classmethod
@@ -144,6 +155,14 @@ class AgentGuardConfig(BaseModel):
         env_bind = os.environ.get("AGENTGUARD_GATEWAY_BIND_HOST")
         if env_bind:
             data["gateway_bind_host"] = env_bind
+
+        env_extra_sp = os.environ.get("AGENTGUARD_SELF_PROTECT_EXTRA_PATHS")
+        if env_extra_sp:
+            sp_data = data.get("self_protection", {}) or {}
+            sp_data["extra_paths"] = [
+                p.strip() for p in env_extra_sp.split(",") if p.strip()
+            ]
+            data["self_protection"] = sp_data
 
         # Federal mode env overrides
         federal_data = data.get("federal", {})

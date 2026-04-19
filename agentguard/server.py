@@ -160,9 +160,47 @@ class StdioServer:
                 })
             return
 
-        # With no upstream configured, every request past initialize gets a
-        # minimal synthesized response so the MCP client handshake doesn't hang.
-        # Tools/list returns empty; everything else returns an empty result.
+        # tools/call always goes through ProxyCore so self-protection,
+        # detectors, and policy run regardless of whether an upstream is
+        # configured. An unattended gateway still records every attempt.
+        if method == "tools/call":
+            tool_name = params.get("name", "")
+            tool_args = params.get("arguments", {})
+            should_forward, decision, warnings = self.proxy.handle_tool_call(
+                tool_name, tool_args
+            )
+            for w in warnings:
+                logger.warning("[AgentGuard] %s", w)
+
+            if not should_forward:
+                # Return a denial response to the client
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "error": {
+                        "code": -32603,
+                        "message": f"[AgentGuard] Tool call denied: {decision.reason}",
+                        "data": {
+                            "nist_controls": decision.nist_controls,
+                            "policy_bundle": decision.policy_bundle,
+                        },
+                    },
+                }
+                self._write_response(error_response)
+                return
+            if self._upstream_proc is not None:
+                self._forward_to_upstream(raw)
+            else:
+                # No upstream — synthesized "nothing to forward" result so
+                # the client handshake doesn't hang.
+                self._write_response({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {"content": [], "isError": False},
+                })
+            return
+
+        # Remaining no-upstream short-circuit for list methods + generic pass.
         if self._upstream_proc is None:
             if method == "tools/list":
                 self._write_response({
@@ -183,35 +221,6 @@ class StdioServer:
                     "id": msg.get("id"),
                     "result": {},
                 })
-            return
-
-        # Handle tools/call — full policy + detector stack
-        if method == "tools/call":
-            tool_name = params.get("name", "")
-            tool_args = params.get("arguments", {})
-            should_forward, decision, warnings = self.proxy.handle_tool_call(
-                tool_name, tool_args
-            )
-            for w in warnings:
-                logger.warning("[AgentGuard] %s", w)
-
-            if should_forward:
-                self._forward_to_upstream(raw)
-            else:
-                # Return a denial response to the client
-                error_response = {
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "error": {
-                        "code": -32603,
-                        "message": f"[AgentGuard] Tool call denied: {decision.reason}",
-                        "data": {
-                            "nist_controls": decision.nist_controls,
-                            "policy_bundle": decision.policy_bundle,
-                        },
-                    },
-                }
-                self._write_response(error_response)
             return
 
         # Handle tools/list — scan tool descriptions
