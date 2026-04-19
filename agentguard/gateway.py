@@ -9,10 +9,11 @@ Requires the `fastapi` and `uvicorn` packages (optional dependencies).
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from agentguard.audit_log import AuditLog
 from agentguard.config import AgentGuardConfig
@@ -36,7 +37,7 @@ def create_app(config: AgentGuardConfig) -> Any:
         ImportError: If fastapi is not installed.
     """
     try:
-        from fastapi import FastAPI, HTTPException, Request
+        from fastapi import Depends, FastAPI, Header, HTTPException, Request
         from fastapi.responses import JSONResponse
     except ImportError as e:
         raise ImportError(
@@ -48,12 +49,40 @@ def create_app(config: AgentGuardConfig) -> Any:
     audit_log = AuditLog(
         db_path=config.audit_db_path,
         signing_key=config.signing_key or None,
+        verify_key=config.verify_key or None,
     )
     if mode == Mode.FEDERAL and not audit_log.signing_enabled:
         raise ValueError(
             "Federal mode requires a valid Ed25519 signing key. "
             "Set signing_key in config or AGENTGUARD_SIGNING_KEY."
         )
+    if mode == Mode.FEDERAL and not config.gateway_api_keys:
+        raise ValueError(
+            "Federal mode requires at least one gateway API key. "
+            "Set gateway_api_keys in config or AGENTGUARD_GATEWAY_API_KEYS."
+        )
+
+    api_keys = set(config.gateway_api_keys or [])
+
+    async def require_api_key(
+        x_agentguard_api_key: str = Header(default=""),
+    ) -> str:
+        """Reject any request without a valid API key when auth is configured.
+
+        Dev mode with zero configured keys keeps the historical open-door
+        behaviour for local Claude Code experiments, but warns loudly. Any
+        key list at all flips auth on for every route.
+        """
+        if not api_keys:
+            return "anonymous-dev"
+        presented = x_agentguard_api_key or ""
+        for known in api_keys:
+            if hmac.compare_digest(presented, known):
+                # Never log the key value itself.
+                return hmac.new(
+                    b"agentguard-keyid", known.encode(), "sha256"
+                ).hexdigest()[:12]
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     bundles: list[PolicyBundle] = []
     for path_str in config.policy_bundles:
@@ -75,15 +104,17 @@ def create_app(config: AgentGuardConfig) -> Any:
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        """Health check endpoint."""
+        """Health check endpoint. Unauthenticated by design."""
         return {
             "status": "ok",
             "mode": config.mode,
-            "audit_events": audit_log.count(),
         }
 
     @app.post("/mcp")
-    async def mcp_endpoint(request: Request) -> JSONResponse:
+    async def mcp_endpoint(
+        request: Request,
+        _caller: str = Depends(require_api_key),
+    ) -> JSONResponse:
         """Main MCP message endpoint.
 
         Accepts JSON-RPC messages, processes through AgentGuard proxy,
@@ -133,12 +164,17 @@ def create_app(config: AgentGuardConfig) -> Any:
         })
 
     @app.get("/audit/tail")
-    async def audit_tail(n: int = 20) -> dict[str, Any]:
+    async def audit_tail(
+        n: int = 20,
+        _caller: str = Depends(require_api_key),
+    ) -> dict[str, Any]:
         """Return the most recent audit events."""
         return {"events": audit_log.tail(n=n)}
 
     @app.get("/audit/verify")
-    async def audit_verify() -> dict[str, Any]:
+    async def audit_verify(
+        _caller: str = Depends(require_api_key),
+    ) -> dict[str, Any]:
         """Verify the audit log hash chain integrity."""
         valid, message = audit_log.verify_chain()
         return {"valid": valid, "message": message}
@@ -146,13 +182,21 @@ def create_app(config: AgentGuardConfig) -> Any:
     return app
 
 
-def run_gateway(config: AgentGuardConfig, host: str = "0.0.0.0", port: int = 8080) -> None:
+def run_gateway(
+    config: AgentGuardConfig,
+    host: Optional[str] = None,
+    port: int = 8080,
+    ssl_keyfile: Optional[str] = None,
+    ssl_certfile: Optional[str] = None,
+) -> None:
     """Start the HTTP gateway server.
 
     Args:
         config: Loaded AgentGuard configuration.
-        host: Bind host address.
+        host: Bind host. Defaults to config.gateway_bind_host (127.0.0.1).
         port: Bind port.
+        ssl_keyfile: Optional TLS private key. Required in federal mode.
+        ssl_certfile: Optional TLS certificate. Required in federal mode.
     """
     try:
         import uvicorn
@@ -161,6 +205,31 @@ def run_gateway(config: AgentGuardConfig, host: str = "0.0.0.0", port: int = 808
             "HTTP gateway mode requires uvicorn. Install with: pip install uvicorn"
         ) from e
 
+    effective_host = host or config.gateway_bind_host or "127.0.0.1"
+
+    if Mode(config.mode) == Mode.FEDERAL:
+        if not (ssl_keyfile and ssl_certfile):
+            raise ValueError(
+                "Federal mode requires TLS. Provide ssl_keyfile and ssl_certfile."
+            )
+        if effective_host == "0.0.0.0" and not config.gateway_api_keys:
+            raise ValueError(
+                "Federal mode refuses to bind 0.0.0.0 without API keys configured."
+            )
+
     app = create_app(config)
-    logger.info("AgentGuard HTTP gateway starting on %s:%d (mode=%s)", host, port, config.mode)
-    uvicorn.run(app, host=host, port=port)
+    logger.info(
+        "AgentGuard HTTP gateway starting on %s:%d (mode=%s, tls=%s, auth=%s)",
+        effective_host,
+        port,
+        config.mode,
+        bool(ssl_keyfile and ssl_certfile),
+        "on" if config.gateway_api_keys else "off",
+    )
+    uvicorn.run(
+        app,
+        host=effective_host,
+        port=port,
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
+    )

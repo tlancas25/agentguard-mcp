@@ -267,7 +267,7 @@ See `examples/claude_code_integration.md` for the complete setup guide.
 - FedRAMP 20x ready: emits OSCAL 1.1.2 Component Definition JSON (`agentguard/reports/oscal.py`)
 - CMMC 2.0 Level 2/3 evidence pack (v0.2 roadmap; scaffold in `agentguard/nist/cmmc.py`)
 - Dual-mode design: transparent in development, rigorous in production
-- Built by a U.S. Army veteran with DoD 8140.03-compliant certifications (CySA+, PenTest+, Security+)
+- DoD 8140.03-compliant certifications: CySA+, PenTest+, Security+
 
 ---
 
@@ -435,4 +435,4 @@ Contributions are welcome, especially NIST control implementations, attack patte
 
 MIT License. Copyright (c) 2026 Terrell Lancaster.
 
-Built by a U.S. Army veteran (2004-2012, Honorable Discharge) with DoD 8140.03-compliant certifications (CySA+, PenTest+, Security+). If you know what an ATO actually costs, you know why this exists.
+If you know what an ATO actually costs, you know why this exists.

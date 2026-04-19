@@ -14,16 +14,29 @@ import re
 from typing import Any
 
 from agentguard.detectors import DetectionResult
+from agentguard.detectors.normalize import concatenated, expand_variants
 
 NIST_CONTROLS = ["SI-10", "SC-28"]
+
+# Separator characters accepted between SSN groups; covers ASCII -, ASCII space,
+# dot, and unicode dashes that attackers swap in to dodge naive regex.
+_SSN_SEP = r"[-\u2010-\u2015.\u2212 \u00a0\u2007\u202f]"
+_SSN_STRICT_RE = re.compile(
+    rf"\b(?!000|666)\d{{3}}{_SSN_SEP}(?!00)\d{{2}}{_SSN_SEP}(?!0000)\d{{4}}\b"
+)
 
 
 # PII regex patterns
 _PII_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    # US Social Security Number
+    # US Social Security Number — accepts ASCII dash/space and common unicode
+    # dash variants. Bare 9-digit runs are caught by the unpunctuated pattern.
     (
         "ssn",
-        re.compile(r"\b(?!000|666)\d{3}[- ](?!00)\d{2}[- ](?!0000)\d{4}\b"),
+        _SSN_STRICT_RE,
+    ),
+    (
+        "ssn_unpunct",
+        re.compile(r"(?<!\d)(?!000)(?!666)\d{3}(?!00)\d{2}(?!0000)\d{4}(?!\d)"),
     ),
     # Credit card numbers (Visa, MC, Amex, Discover) with Luhn-plausible structure
     (
@@ -112,17 +125,22 @@ def detect(text: str) -> DetectionResult:
     types_found: list[str] = []
     findings: list[dict[str, Any]] = []
 
-    for pii_type, pattern in _PII_PATTERNS:
-        matches = pattern.findall(text)
-        if matches:
-            types_found.append(pii_type)
-            findings.append({"type": pii_type, "count": len(matches)})
+    seen: set[str] = set()
+    for variant in expand_variants(text):
+        for pii_type, pattern in _PII_PATTERNS:
+            if pii_type in seen:
+                continue
+            matches = pattern.findall(variant)
+            if matches:
+                seen.add(pii_type)
+                types_found.append(pii_type)
+                findings.append({"type": pii_type, "count": len(matches)})
 
     if not types_found:
         return DetectionResult.clean(NIST_CONTROLS)
 
     # Score based on number and severity of types found
-    high_severity = {"ssn", "credit_card", "passport", "mrn_hint"}
+    high_severity = {"ssn", "ssn_unpunct", "credit_card", "passport", "mrn_hint"}
     score = min(
         1.0,
         len(types_found) * 0.2 + sum(0.3 for t in types_found if t in high_severity),
@@ -163,6 +181,17 @@ def detect_in_tool_args(tool_args: dict[str, Any]) -> DetectionResult:
             if nested.score > worst.score:
                 worst = nested
                 all_types.extend(nested.types_found)
+
+    # Flatten every nested string and re-scan so attackers can't hide PII
+    # by splitting it across arg keys (F5).
+    flat = concatenated(tool_args)
+    if flat:
+        flat_result = detect(flat)
+        if flat_result.matched:
+            all_types.extend(flat_result.types_found)
+            if flat_result.score > worst.score:
+                worst = flat_result
+                worst.detail = f"PII in combined args: {flat_result.detail}"
 
     if all_types:
         worst.types_found = list(set(all_types))

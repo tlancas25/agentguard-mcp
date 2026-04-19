@@ -16,6 +16,7 @@ import re
 from typing import Any, Callable, Optional
 
 from agentguard.detectors import DetectionResult
+from agentguard.detectors.normalize import concatenated, expand_variants
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +73,21 @@ def detect(
     patterns_hit: list[str] = []
     aggregate_score: float = 0.0
 
-    for name, compiled, score in _COMPILED_PATTERNS:
-        if compiled.search(text):
-            patterns_hit.append(name)
-            # Scores combine but cap at 1.0
-            aggregate_score = min(1.0, aggregate_score + score)
+    # Scan the original plus every decoded / normalized variant so
+    # unicode-homoglyph, base64, hex, rot13, and URL-encoded wrappers
+    # can't hide an injection from the regex layer (F5).
+    hit_names: set[str] = set()
+    for variant in expand_variants(text):
+        for name, compiled, score in _COMPILED_PATTERNS:
+            if name in hit_names:
+                continue
+            if compiled.search(variant):
+                hit_names.add(name)
+                patterns_hit.append(name)
+                aggregate_score = min(1.0, aggregate_score + score)
 
-    # Heuristic: suspicious keyword density
-    density_score = _keyword_density_score(text)
+    # Heuristic: suspicious keyword density over the canonical form
+    density_score = _keyword_density_score(expand_variants(text)[1])
     if density_score > 0.3:
         patterns_hit.append(f"keyword_density:{density_score:.2f}")
         aggregate_score = min(1.0, aggregate_score + density_score * 0.5)
@@ -133,6 +141,16 @@ def detect_in_tool_args(
             nested = detect_in_tool_args(value, score_threshold)
             if nested.score > worst.score:
                 worst = nested
+
+    # Flattened view: defeats payloads split across arg keys.
+    flat = concatenated(tool_args)
+    if flat:
+        flat_result = detect(flat, score_threshold=score_threshold)
+        if flat_result.score > worst.score:
+            worst = flat_result
+            worst.detail = (
+                f"Injection detected across combined args: {flat_result.detail}"
+            )
 
     return worst
 

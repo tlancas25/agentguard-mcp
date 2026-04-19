@@ -23,6 +23,14 @@ REPO="tlancas25/agentguard-mcp"
 MIN_PY="3.11"
 NEED_PATH_HINT=0
 
+# AGENTGUARD_REF pins the git ref (tag or commit SHA) installed from the
+# upstream repo. Defaults to the latest signed release tag. Override with:
+#   AGENTGUARD_REF=v0.2.0 curl ... | bash
+AGENTGUARD_REF="${AGENTGUARD_REF:-v0.1.1}"
+# Optional: AGENTGUARD_UV_SHA256 of astral's uv installer, if you want an
+# extra integrity check on the chained upstream. See README "Install options".
+AGENTGUARD_UV_SHA256="${AGENTGUARD_UV_SHA256:-}"
+
 # ---------- styling ----------
 if [ -t 1 ]; then
   BOLD=$(printf '\033[1m'); RESET=$(printf '\033[0m')
@@ -60,7 +68,23 @@ fi
 # ---------- uv install ----------
 if ! command -v uv >/dev/null 2>&1; then
   info "Installing uv (Astral's fast Python package manager)"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  UV_TMP=$(mktemp)
+  curl -LsSf https://astral.sh/uv/install.sh -o "$UV_TMP"
+  if [ -n "$AGENTGUARD_UV_SHA256" ]; then
+    ACTUAL=$(shasum -a 256 "$UV_TMP" 2>/dev/null | awk '{print $1}')
+    if [ -z "$ACTUAL" ]; then
+      ACTUAL=$(sha256sum "$UV_TMP" | awk '{print $1}')
+    fi
+    if [ "$ACTUAL" != "$AGENTGUARD_UV_SHA256" ]; then
+      rm -f "$UV_TMP"
+      die "uv installer SHA-256 mismatch. Got $ACTUAL expected $AGENTGUARD_UV_SHA256"
+    fi
+    ok "uv installer SHA-256 verified"
+  else
+    warn "Skipping uv installer checksum (set AGENTGUARD_UV_SHA256 to pin)"
+  fi
+  sh "$UV_TMP"
+  rm -f "$UV_TMP"
   # uv installs to ~/.local/bin by default
   if [ -d "$HOME/.local/bin" ]; then
     export PATH="$HOME/.local/bin:$PATH"
@@ -75,9 +99,10 @@ else
 fi
 
 # ---------- AgentGuard install ----------
-info "Installing AgentGuard MCP from github.com/$REPO"
+info "Installing AgentGuard MCP from github.com/$REPO@$AGENTGUARD_REF"
 # --force makes re-runs upgrade cleanly; --python pins the interpreter
-uv tool install --force --python "$MIN_PY" "git+https://github.com/$REPO.git"
+uv tool install --force --python "$MIN_PY" \
+  "git+https://github.com/$REPO.git@$AGENTGUARD_REF"
 
 # ---------- Verify ----------
 # uv tool install puts binaries in $HOME/.local/bin or a uv-managed bin dir.

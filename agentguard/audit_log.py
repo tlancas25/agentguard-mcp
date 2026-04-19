@@ -50,13 +50,26 @@ class AuditEvent:
         self.timestamp = datetime.now(timezone.utc).isoformat()
 
     def canonical_fields(self) -> dict[str, Any]:
-        """Return the fields that are included in the event hash."""
+        """Return the fields that are included in the event hash.
+
+        tool_result_json is covered here so the hash chain protects the
+        actual outcome of each tool call, not only the request side
+        (AU-9 / AU-10). Keep this shape in sync with verify_chain().
+        """
+        if self.tool_result is None:
+            tool_result_json: Optional[str] = None
+        else:
+            try:
+                tool_result_json = json.dumps(self.tool_result, sort_keys=True)
+            except (TypeError, ValueError):
+                tool_result_json = str(self.tool_result)
         return {
             "timestamp": self.timestamp,
             "agent_id": self.agent_id,
             "event_type": self.event_type,
             "tool_name": self.tool_name,
             "tool_args_json": json.dumps(self.tool_args, sort_keys=True),
+            "tool_result_json": tool_result_json,
             "decision": self.decision,
             "policy_matched": self.policy_matched,
             "nist_controls_json": json.dumps(sorted(self.nist_controls)),
@@ -71,20 +84,39 @@ class AuditLog:
     or insertion of events will break the chain and be detected by verify_chain().
     """
 
-    def __init__(self, db_path: Path, signing_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        signing_key: Optional[str] = None,
+        verify_key: Optional[str] = None,
+    ) -> None:
         """Initialize the audit log.
 
         Args:
             db_path: Path to the SQLite database file.
             signing_key: Base64-encoded Ed25519 private key for event signing.
                          If None, events are not signed.
+            verify_key: Base64-encoded Ed25519 public key used by verify_chain()
+                        to validate each event's signature. If None, the public
+                        key is derived from signing_key when possible. If no
+                        verify key is available, signatures are not checked and
+                        verify_chain() says so in its message.
         """
         self.db_path = db_path
         self._signing_key = signing_key
         self._signer: Optional[Any] = None
+        self._verifier: Optional[Any] = None
 
         if signing_key:
             self._init_signer(signing_key)
+
+        if verify_key:
+            self._init_verifier(verify_key)
+        elif self._signer is not None:
+            try:
+                self._verifier = self._signer.public_key()
+            except Exception as e:
+                logger.warning("Could not derive verify key from signing key: %s", e)
 
         self._init_db()
 
@@ -107,6 +139,23 @@ class AuditLog:
         except Exception as e:
             logger.warning("Failed to initialize signing key: %s. Events will not be signed.", e)
             self._signer = None
+
+    def _init_verifier(self, verify_key_b64: str) -> None:
+        """Initialize the Ed25519 verifier from a base64-encoded public key."""
+        try:
+            import base64
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PublicKey,
+            )
+
+            key_bytes = base64.b64decode(verify_key_b64)
+            self._verifier = Ed25519PublicKey.from_public_bytes(key_bytes)
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize verify key: %s. Signatures will not be checked.",
+                e,
+            )
+            self._verifier = None
 
     def _sign(self, data: str) -> Optional[str]:
         """Sign data with Ed25519 and return base64-encoded signature."""
@@ -196,13 +245,6 @@ class AuditLog:
             event_hash = self._compute_hash(prev_hash, canonical)
             signature = self._sign(event_hash)
 
-            tool_result_json: Optional[str] = None
-            if event.tool_result is not None:
-                try:
-                    tool_result_json = json.dumps(event.tool_result)
-                except (TypeError, ValueError):
-                    tool_result_json = str(event.tool_result)
-
             cursor = conn.execute(
                 """
                 INSERT INTO events (
@@ -216,11 +258,11 @@ class AuditLog:
                     event.agent_id,
                     event.event_type,
                     event.tool_name,
-                    json.dumps(event.tool_args, sort_keys=True),
-                    tool_result_json,
+                    canonical["tool_args_json"],
+                    canonical["tool_result_json"],
                     event.decision,
                     event.policy_matched,
-                    json.dumps(sorted(event.nist_controls)),
+                    canonical["nist_controls_json"],
                     prev_hash,
                     event_hash,
                     signature,
@@ -243,6 +285,7 @@ class AuditLog:
             return True, "Audit log is empty."
 
         prev_hash = GENESIS_HASH
+        signatures_checked = 0
         for row in rows:
             canonical = {
                 "timestamp": row["timestamp"],
@@ -250,6 +293,7 @@ class AuditLog:
                 "event_type": row["event_type"],
                 "tool_name": row["tool_name"],
                 "tool_args_json": row["tool_args_json"],
+                "tool_result_json": row["tool_result_json"],
                 "decision": row["decision"],
                 "policy_matched": row["policy_matched"],
                 "nist_controls_json": row["nist_controls_json"],
@@ -268,9 +312,41 @@ class AuditLog:
                     f"Hash mismatch at event id={row['id']}: "
                     f"event has been tampered with.",
                 )
+
+            if self._verifier is not None:
+                sig_b64 = row["signature"]
+                if not sig_b64:
+                    return (
+                        False,
+                        f"Missing signature at event id={row['id']}: "
+                        f"a verify key is configured but this event is unsigned.",
+                    )
+                try:
+                    import base64
+
+                    sig_bytes = base64.b64decode(sig_b64)
+                    self._verifier.verify(sig_bytes, row["event_hash"].encode())
+                    signatures_checked += 1
+                except Exception:
+                    return (
+                        False,
+                        f"Invalid signature at event id={row['id']}: "
+                        f"Ed25519 verification failed.",
+                    )
+
             prev_hash = row["event_hash"]
 
-        return True, f"Chain verified. {len(rows)} events intact."
+        if self._verifier is not None:
+            return (
+                True,
+                f"Chain verified. {len(rows)} events intact, "
+                f"{signatures_checked} signatures validated.",
+            )
+        return (
+            True,
+            f"Chain verified. {len(rows)} events intact (signatures not checked: "
+            f"no verify key configured).",
+        )
 
     def tail(self, n: int = 20) -> list[dict[str, Any]]:
         """Return the most recent n audit events as dicts."""

@@ -183,7 +183,6 @@ Key things to watch quarterly:
 
 ## Terrell's Positioning (context for marketing/resume copy)
 
-- U.S. Army veteran (2004-2012, Honorable Discharge)
 - Secret clearance eligible for reinstatement
 - Certifications: CompTIA CySA+, PenTest+, Security+ (DoD 8140 IAT Level II / 8140.03 compliant)
 - B.S. Cybersecurity and Information Assurance (WGU, 2026)

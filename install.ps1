@@ -23,6 +23,10 @@ $ErrorActionPreference = "Stop"
 
 $Repo  = "tlancas25/agentguard-mcp"
 $MinPy = "3.11"
+# AGENTGUARD_REF pins the git ref (tag or commit SHA). Defaults to the
+# latest signed release tag. Override: $env:AGENTGUARD_REF = "v0.2.0"
+$Ref = if ($env:AGENTGUARD_REF) { $env:AGENTGUARD_REF } else { "v0.1.1" }
+$ExpectedUvSha256 = $env:AGENTGUARD_UV_SHA256
 
 function Write-Info  ($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-OK    ($msg) { Write-Host "OK  $msg" -ForegroundColor Green }
@@ -60,7 +64,23 @@ $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
 if (-not $uvCmd) {
     Write-Info "Installing uv (Astral's fast Python package manager)"
     try {
-        powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://astral.sh/uv/install.ps1 | iex"
+        $uvTmp = Join-Path $env:TEMP "uv-install-$([Guid]::NewGuid()).ps1"
+        Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://astral.sh/uv/install.ps1" `
+            -OutFile $uvTmp
+        if ($ExpectedUvSha256) {
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $uvTmp).Hash.ToLower()
+            if ($actual -ne $ExpectedUvSha256.ToLower()) {
+                Remove-Item -Force $uvTmp
+                Write-Err "uv installer SHA-256 mismatch. Got $actual expected $ExpectedUvSha256"
+                exit 1
+            }
+            Write-OK "uv installer SHA-256 verified"
+        } else {
+            Write-Warn2 "Skipping uv installer checksum (set AGENTGUARD_UV_SHA256 to pin)"
+        }
+        & powershell -NoProfile -File $uvTmp
+        Remove-Item -Force $uvTmp
     } catch {
         Write-Err "uv install failed: $($_.Exception.Message)"
         exit 1
@@ -81,9 +101,9 @@ if (-not $uvCmd) {
 }
 
 # ---------- AgentGuard install ----------
-Write-Info "Installing AgentGuard MCP from github.com/$Repo"
+Write-Info "Installing AgentGuard MCP from github.com/$Repo@$Ref"
 try {
-    uv tool install --force --python $MinPy "git+https://github.com/$Repo.git"
+    uv tool install --force --python $MinPy "git+https://github.com/$Repo.git@$Ref"
 } catch {
     Write-Err "AgentGuard install failed: $($_.Exception.Message)"
     exit 1

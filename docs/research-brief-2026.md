@@ -365,7 +365,7 @@ Based on this research, AgentGuard's honest, defensible marketing claims are:
 - "FedRAMP 20x ready — emits OSCAL-compatible evidence"
 - "CMMC 2.0 Level 2 and Level 3 evidence pack (v0.2 roadmap)"
 - "Dual-mode design: transparent in development, rigorous in production"
-- "Built by a cleared veteran with DoD 8140.03-compliant certifications (CySA+, PenTest+, Security+)"
+- "DoD 8140.03-compliant certifications: CySA+, PenTest+, Security+"
 
 ### ❌ Claims to Avoid
 - "First ever..." (false — mcp-firewall exists)

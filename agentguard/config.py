@@ -66,6 +66,9 @@ class AgentGuardConfig(BaseModel):
     mode: Literal["dev", "federal"] = "dev"
     audit_db_path: Path = Path("./audit.db")
     signing_key: str = ""
+    verify_key: str = ""
+    gateway_api_keys: list[str] = Field(default_factory=list)
+    gateway_bind_host: str = "127.0.0.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     upstream_servers: list[UpstreamServerConfig] = Field(default_factory=list)
     policy_bundles: list[str] = Field(default_factory=list)
@@ -80,15 +83,27 @@ class AgentGuardConfig(BaseModel):
 
     @classmethod
     def from_yaml(cls, config_path: Path) -> "AgentGuardConfig":
-        """Load config from a YAML file, then overlay environment variables."""
+        """Load config from a YAML file, then overlay environment variables.
+
+        Federal mode asserted in YAML cannot be downgraded by an environment
+        variable. A downgrade attempt raises RuntimeError so callers and
+        operators see the attempt instead of silently getting a permissive
+        gateway (F4b).
+        """
         data: dict = {}
         if config_path.exists():
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
 
-        # Environment variable overrides
+        yaml_mode = data.get("mode")
         env_mode = os.environ.get("AGENTGUARD_MODE")
         if env_mode:
+            if yaml_mode == "federal" and env_mode != "federal":
+                raise RuntimeError(
+                    "AGENTGUARD_MODE environment variable attempted to "
+                    f"downgrade federal mode to '{env_mode}'. Refusing to "
+                    "start. Remove the env var or change the YAML."
+                )
             data["mode"] = env_mode
 
         env_db = os.environ.get("AGENTGUARD_AUDIT_DB")
@@ -99,9 +114,23 @@ class AgentGuardConfig(BaseModel):
         if env_signing:
             data["signing_key"] = env_signing
 
+        env_verify = os.environ.get("AGENTGUARD_VERIFY_KEY")
+        if env_verify:
+            data["verify_key"] = env_verify
+
         env_log = os.environ.get("AGENTGUARD_LOG_LEVEL")
         if env_log:
             data["log_level"] = env_log
+
+        env_api_keys = os.environ.get("AGENTGUARD_GATEWAY_API_KEYS")
+        if env_api_keys:
+            data["gateway_api_keys"] = [
+                k.strip() for k in env_api_keys.split(",") if k.strip()
+            ]
+
+        env_bind = os.environ.get("AGENTGUARD_GATEWAY_BIND_HOST")
+        if env_bind:
+            data["gateway_bind_host"] = env_bind
 
         # Federal mode env overrides
         federal_data = data.get("federal", {})
@@ -120,7 +149,21 @@ class AgentGuardConfig(BaseModel):
         if federal_data:
             data["federal"] = federal_data
 
-        return cls(**data)
+        cfg = cls(**data)
+
+        # Federal mode: force-enable every detector and close fail-open holes
+        # that would otherwise survive a sparse YAML (F7).
+        if cfg.mode == "federal":
+            cfg.detectors.prompt_injection.enabled = True
+            cfg.detectors.pii.enabled = True
+            cfg.detectors.secrets.enabled = True
+            cfg.detectors.tool_poisoning.enabled = True
+            cfg.detectors.prompt_injection.action = "deny"
+            cfg.detectors.pii.action = "deny"
+            cfg.detectors.secrets.action = "deny"
+            cfg.detectors.tool_poisoning.action = "deny"
+
+        return cfg
 
     @classmethod
     def default_dev(cls) -> "AgentGuardConfig":

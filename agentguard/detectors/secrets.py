@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from agentguard.detectors import DetectionResult
+from agentguard.detectors.normalize import concatenated, expand_variants
 
 NIST_CONTROLS = ["SI-10", "SC-8", "AC-3"]
 
@@ -55,10 +56,14 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str], float]] = [
         re.compile(r"\beyJ[0-9a-zA-Z\-_]+\.[0-9a-zA-Z\-_]+\.[0-9a-zA-Z\-_]+\b"),
         0.9,
     ),
-    # PEM private keys
+    # PEM private keys. The trailing "private key" marker alone is enough
+    # signal even if dashes have been stripped or case changed.
     (
         "pem_private_key",
-        re.compile(r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+|DSA\s+)?PRIVATE KEY-----"),
+        re.compile(
+            r"(?:-{2,}\s*)?BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+|DSA\s+|ENCRYPTED\s+)?PRIVATE\s+KEY",
+            re.IGNORECASE,
+        ),
         0.99,
     ),
     # Slack tokens
@@ -135,15 +140,24 @@ def detect(text: str, confidence_threshold: float = 0.6) -> DetectionResult:
     findings: list[dict[str, Any]] = []
     max_score: float = 0.0
 
-    for secret_type, pattern, confidence in _SECRET_PATTERNS:
-        if confidence < confidence_threshold:
-            continue
-        matches = pattern.findall(text)
-        if matches:
-            types_found.append(secret_type)
-            findings.append({"type": secret_type, "count": len(matches), "confidence": confidence})
-            if confidence > max_score:
-                max_score = confidence
+    seen: set[str] = set()
+    for variant in expand_variants(text):
+        for secret_type, pattern, confidence in _SECRET_PATTERNS:
+            if confidence < confidence_threshold:
+                continue
+            if secret_type in seen:
+                continue
+            matches = pattern.findall(variant)
+            if matches:
+                seen.add(secret_type)
+                types_found.append(secret_type)
+                findings.append({
+                    "type": secret_type,
+                    "count": len(matches),
+                    "confidence": confidence,
+                })
+                if confidence > max_score:
+                    max_score = confidence
 
     if not types_found:
         return DetectionResult.clean(NIST_CONTROLS)
@@ -176,6 +190,15 @@ def detect_in_tool_args(tool_args: dict[str, Any]) -> DetectionResult:
             if nested.score > worst.score:
                 worst = nested
                 all_types.extend(nested.types_found)
+
+    flat = concatenated(tool_args)
+    if flat:
+        flat_result = detect(flat)
+        if flat_result.matched:
+            all_types.extend(flat_result.types_found)
+            if flat_result.score > worst.score:
+                worst = flat_result
+                worst.detail = f"Secret in combined args: {flat_result.detail}"
 
     if all_types:
         worst.types_found = list(set(all_types))

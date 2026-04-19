@@ -2,7 +2,7 @@
   "name": "agentguard-mcp",
   "display_name": "AgentGuard MCP",
   "tagline": "MCP security gateway for federal and defense AI — NIST 800-53 + FedRAMP",
-  "description": "AgentGuard MCP is a transparent proxy between AI agents and MCP servers that enforces NIST 800-53 Rev 5 controls, generates FedRAMP audit evidence, and detects prompt injection, PII, and tool poisoning attacks. Built for federal and defense environments by a U.S. Army veteran.\n\nDev mode works as a silent observer — zero workflow friction. Federal mode enforces policy, signs every audit event, and generates compliance reports on demand.",
+  "description": "AgentGuard MCP is a transparent proxy between AI agents and MCP servers that enforces NIST 800-53 Rev 5 controls, generates FedRAMP audit evidence, and detects prompt injection, PII, and tool poisoning attacks. Built for federal and defense environments.\n\nDev mode works as a silent observer — zero workflow friction. Federal mode enforces policy, signs every audit event, and generates compliance reports on demand.",
   "version": "0.1.0",
   "author": {
     "name": "Terrell Lancaster",
