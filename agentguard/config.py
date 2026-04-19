@@ -13,6 +13,15 @@ from typing import Optional, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+# Default per-user data directory. Chosen so that a user who runs
+# `agentguard run` from any cwd (including when launched by Claude Code,
+# Cursor, systemd, etc.) always lands on the same audit DB. Operators who
+# need a different location can still set `audit_db_path` in YAML or the
+# AGENTGUARD_AUDIT_DB env var.
+DEFAULT_AGENTGUARD_HOME = Path.home() / ".agentguard"
+DEFAULT_AUDIT_DB_PATH = DEFAULT_AGENTGUARD_HOME / "audit.db"
+DEFAULT_CONFIG_PATH = DEFAULT_AGENTGUARD_HOME / "agentguard.yaml"
+
 
 class UpstreamServerConfig(BaseModel):
     """Configuration for a single upstream MCP server."""
@@ -64,7 +73,7 @@ class AgentGuardConfig(BaseModel):
     """Root configuration model for AgentGuard."""
 
     mode: Literal["dev", "federal"] = "dev"
-    audit_db_path: Path = Path("./audit.db")
+    audit_db_path: Path = Field(default_factory=lambda: DEFAULT_AUDIT_DB_PATH)
     signing_key: str = ""
     verify_key: str = ""
     gateway_api_keys: list[str] = Field(default_factory=list)
@@ -78,8 +87,12 @@ class AgentGuardConfig(BaseModel):
     @field_validator("audit_db_path", mode="before")
     @classmethod
     def coerce_path(cls, v: object) -> Path:
-        """Coerce string to Path."""
-        return Path(str(v))
+        """Coerce to Path and expand ``~`` / environment variables so the
+        user can write ``~/.agentguard/audit.db`` in YAML without surprise."""
+        if v is None or v == "":
+            return DEFAULT_AUDIT_DB_PATH
+        s = os.path.expanduser(os.path.expandvars(str(v)))
+        return Path(s)
 
     @classmethod
     def from_yaml(cls, config_path: Path) -> "AgentGuardConfig":

@@ -9,8 +9,11 @@
 # Operating mode: "dev" (permissive, log-only) or "federal" (strict enforcement)
 mode: dev
 
-# Path to SQLite audit database
-audit_db_path: ./audit.db
+# Path to SQLite audit database. Tildes and $VARS are expanded.
+# The default (~/.agentguard/audit.db) keeps the log in one known place
+# regardless of which directory agentguard is launched from. Override by
+# setting this key or the AGENTGUARD_AUDIT_DB env var.
+audit_db_path: ~/.agentguard/audit.db
 
 # Log level: DEBUG | INFO | WARNING | ERROR
 log_level: INFO
@@ -23,15 +26,17 @@ signing_key: ""
 # -------------------------------------------------------------------
 # Upstream MCP Servers (servers AgentGuard protects)
 # -------------------------------------------------------------------
-upstream_servers:
-  - name: filesystem
-    transport: stdio
-    command: uvx
-    args: ["mcp-server-filesystem", "/home/user/projects"]
-    # Optional per-server policy override
-    policy_override: ""
-
-  # Example HTTP upstream
+upstream_servers: []
+  # With an empty list AgentGuard runs as a no-op stdio server that still
+  # logs session_start events. Uncomment an entry below to put a real
+  # MCP server behind AgentGuard.
+  #
+  # - name: filesystem
+  #   transport: stdio
+  #   command: uvx
+  #   args: ["mcp-server-filesystem", "~/Documents/Projects"]
+  #   policy_override: ""
+  #
   # - name: github
   #   transport: http
   #   url: http://localhost:3001
@@ -41,15 +46,9 @@ upstream_servers:
 # -------------------------------------------------------------------
 # Policy Bundles (evaluated in order, first match wins)
 # -------------------------------------------------------------------
-policy_bundles:
-  # Dev mode default: allow all, log everything
-  - ./agentguard/policies/defaults/dev_mode.yaml
-
-  # To enable federal defaults, comment above and uncomment below:
-  # - ./agentguard/policies/defaults/federal_mode.yaml
-
-  # Add custom policies after defaults
-  # - ./examples/sample_policies/deny_destructive_ops.yaml
+policy_bundles: []
+  # Empty list is valid in dev mode (log everything, block nothing).
+  # Point at absolute YAML paths when you want explicit allow/deny rules.
 
 # -------------------------------------------------------------------
 # Federal Mode Settings (ignored in dev mode)

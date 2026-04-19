@@ -45,6 +45,8 @@ Each installer detects your platform, installs [uv](https://github.com/astral-sh
   - [Initialize config](#initialize-config)
   - [Run the gateway](#run-the-gateway)
   - [Add to Claude Code](#add-to-claude-code)
+- [Where AgentGuard stores data](#where-agentguard-stores-data)
+- [Reading the audit log](#reading-the-audit-log)
 - [Architecture](#architecture)
 - [Compatibility](#compatibility)
 - [Defensible Claims](#defensible-claims)
@@ -193,6 +195,82 @@ In your project's `.mcp.json`:
 ```
 
 See `examples/claude_code_integration.md` for the complete setup guide.
+
+---
+
+## Where AgentGuard stores data
+
+By default AgentGuard keeps everything under a single per-user directory so it behaves the same whether you launch it from your shell, from Claude Code, or from a service manager.
+
+| What | Default path |
+|------|--------------|
+| Config file | `~/.agentguard/agentguard.yaml` |
+| Audit database (SQLite) | `~/.agentguard/audit.db` |
+| Signing key (if enabled) | Supplied via `signing_key:` in the YAML or `AGENTGUARD_SIGNING_KEY` env var. AgentGuard never writes the key to disk on your behalf. |
+
+On Windows the same paths resolve to `C:\Users\<you>\.agentguard\` — tilde expansion is handled when the YAML is loaded.
+
+**To change these paths:** set `audit_db_path:` in the YAML (tildes and env vars are expanded), or override at runtime with:
+
+```bash
+export AGENTGUARD_AUDIT_DB=/var/log/agentguard/audit.db
+```
+
+**Who has access:** the audit database is a regular file on your local disk. On multi-user systems, restrict it with the same controls you apply to any sensitive log (`chmod 600` on POSIX, ACLs on Windows). AgentGuard does not chown or chmod it for you.
+
+Every time the gateway starts it prints the resolved paths to stderr so you always know where the log is:
+
+```
+AgentGuard 0.1.0 starting in dev mode via stdio transport
+  config    : C:\Users\you\.agentguard\agentguard.yaml
+  audit DB  : C:\Users\you\.agentguard\audit.db
+  signing   : disabled
+  detectors : secrets, tool_poisoning
+```
+
+---
+
+## Reading the audit log
+
+AgentGuard ships several views on the log. All of them read from the same SQLite file at `audit_db_path`.
+
+**Tail the most recent events:**
+
+```bash
+agentguard audit tail
+agentguard audit tail -n 100
+```
+
+You get a table of `id | timestamp | agent | event_type | tool | decision`. Events are written by the gateway as they happen, so you can leave a second terminal open while your agent runs.
+
+**Verify the hash chain (tamper check):**
+
+```bash
+agentguard audit verify
+```
+
+Prints `PASS` with an event count if the chain is intact, or `FAIL` with the id of the first event that doesn't hash correctly. If you configured `verify_key` in YAML or `AGENTGUARD_VERIFY_KEY`, every Ed25519 signature is also checked.
+
+**Query with raw SQL:**
+
+```bash
+sqlite3 ~/.agentguard/audit.db \
+  "SELECT id, timestamp, agent_id, tool_name, decision FROM events ORDER BY id DESC LIMIT 20;"
+```
+
+Schema: `id, timestamp, agent_id, event_type, tool_name, tool_args_json, tool_result_json, decision, policy_matched, nist_controls_json, prev_hash, event_hash, signature`.
+
+**Export for SIEM / assessor:**
+
+```bash
+# JSONL (one event per line, every field)
+agentguard audit export --format jsonl --output ~/audit-evidence.jsonl
+
+# CSV
+agentguard audit export --format csv --output ~/audit-evidence.csv
+```
+
+**Rotating the log:** AgentGuard does not rotate the SQLite file. For long-running deployments, script a periodic export + `VACUUM` + truncate workflow, or copy the DB off-host to a SIEM before archiving.
 
 ---
 

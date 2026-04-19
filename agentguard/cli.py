@@ -31,11 +31,28 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _resolve_config_path(config_path: str) -> Path:
+    """Pick the right config file.
+
+    If the caller pointed at something real, use it. Otherwise fall back to
+    ``~/.agentguard/agentguard.yaml`` so ``agentguard run`` and
+    ``agentguard audit tail`` work the same from every cwd.
+    """
+    from agentguard.config import DEFAULT_CONFIG_PATH
+
+    explicit = Path(os.path.expanduser(os.path.expandvars(config_path)))
+    if explicit.exists():
+        return explicit
+    if config_path == "agentguard.yaml" and DEFAULT_CONFIG_PATH.exists():
+        return DEFAULT_CONFIG_PATH
+    return explicit
+
+
 def _load_config(config_path: str, mode: Optional[str] = None) -> "AgentGuardConfig":  # type: ignore[name-defined]
     """Load config from file + env, with optional mode override."""
     from agentguard.config import AgentGuardConfig
 
-    path = Path(config_path)
+    path = _resolve_config_path(config_path)
     cfg = AgentGuardConfig.from_yaml(path)
     if mode:
         cfg = cfg.model_copy(update={"mode": mode})
@@ -59,15 +76,31 @@ def cli() -> None:
 @cli.command()
 @click.option("--gen-key", is_flag=True, default=False, help="Generate an Ed25519 signing keypair.")
 @click.option("--force", is_flag=True, default=False, help="Overwrite existing agentguard.yaml.")
-def init(gen_key: bool, force: bool) -> None:
-    """Scaffold agentguard.yaml in the current directory.
+@click.option(
+    "--local",
+    is_flag=True,
+    default=False,
+    help="Scaffold in the current directory instead of ~/.agentguard/.",
+)
+def init(gen_key: bool, force: bool, local: bool) -> None:
+    """Scaffold agentguard.yaml.
 
-    Copies the example config and optionally generates a signing keypair.
+    By default the config and audit DB live under ``~/.agentguard/`` so the
+    gateway is reachable from any shell or subprocess (Claude Code, systemd,
+    etc.) without depending on cwd. Pass ``--local`` to scaffold in the
+    current directory instead.
     """
-    dest = Path("agentguard.yaml")
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME, DEFAULT_CONFIG_PATH
+
+    if local:
+        dest = Path("agentguard.yaml")
+    else:
+        DEFAULT_AGENTGUARD_HOME.mkdir(parents=True, exist_ok=True)
+        dest = DEFAULT_CONFIG_PATH
+
     if dest.exists() and not force:
         err_console.print(
-            f"[yellow]agentguard.yaml already exists. Use --force to overwrite.[/yellow]"
+            f"[yellow]{dest} already exists. Use --force to overwrite.[/yellow]"
         )
         sys.exit(1)
 
@@ -75,13 +108,22 @@ def init(gen_key: bool, force: bool) -> None:
     example_path = Path(__file__).parent.parent / "agentguard.yaml.example"
     if example_path.exists():
         shutil.copy(example_path, dest)
-        console.print(f"[green]Created agentguard.yaml[/green]")
+        console.print(f"[green]Created {dest}[/green]")
     else:
         # Write a minimal config if example not found
         dest.write_text(
-            "mode: dev\naudit_db_path: ./audit.db\npolicy_bundles: []\n"
+            "mode: dev\n"
+            "audit_db_path: ~/.agentguard/audit.db\n"
+            "policy_bundles: []\n"
+            "upstream_servers: []\n"
         )
-        console.print(f"[green]Created minimal agentguard.yaml[/green]")
+        console.print(f"[green]Created minimal {dest}[/green]")
+
+    console.print(
+        f"[dim]Audit DB will be written to "
+        f"[bold]{DEFAULT_AGENTGUARD_HOME / 'audit.db'}[/bold] "
+        f"unless you change audit_db_path in the YAML.[/dim]"
+    )
 
     if gen_key:
         from agentguard.audit_log import generate_signing_keypair
@@ -136,13 +178,47 @@ def run(
     and the upstream MCP server. In HTTP mode, it exposes an MCP-over-HTTP
     endpoint for remote clients.
     """
+    resolved_config = _resolve_config_path(config)
     cfg = _load_config(config, mode)
 
-    console.print(
+    # Banner on stderr so stdio JSON-RPC stream stays clean.
+    err_console.print(
         f"[bold green]AgentGuard {__version__}[/bold green] "
         f"starting in [bold]{cfg.mode}[/bold] mode "
         f"via [bold]{transport}[/bold] transport"
     )
+    err_console.print(f"  config    : {resolved_config}")
+    err_console.print(f"  audit DB  : {cfg.audit_db_path}")
+    err_console.print(
+        f"  signing   : "
+        + ("[green]enabled[/green]" if cfg.signing_key else "[yellow]disabled[/yellow]")
+    )
+    err_console.print(
+        f"  detectors : "
+        + ", ".join(
+            name
+            for name, det in [
+                ("prompt_injection", cfg.detectors.prompt_injection),
+                ("pii", cfg.detectors.pii),
+                ("secrets", cfg.detectors.secrets),
+                ("tool_poisoning", cfg.detectors.tool_poisoning),
+            ]
+            if det.enabled
+        )
+        or "[dim]none enabled[/dim]"
+    )
+    err_console.print(
+        f"[dim]Read the log: agentguard audit tail  "
+        f"|  verify: agentguard audit verify[/dim]"
+    )
+
+    # Ensure the audit DB's parent directory exists so we don't crash on first write.
+    try:
+        Path(cfg.audit_db_path).parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        err_console.print(
+            f"[yellow]Warning: could not create audit DB directory: {e}[/yellow]"
+        )
 
     if transport == "http":
         from agentguard.gateway import run_gateway
@@ -209,6 +285,39 @@ def audit_tail(config: str, n: int) -> None:
 
     console.print(table)
     console.print(f"[dim]Showing {len(events)} of {log.count()} total events.[/dim]")
+
+
+@audit.command(name="export")
+@click.option("--config", default="agentguard.yaml", show_default=True)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["jsonl", "csv"]),
+    default="jsonl",
+    show_default=True,
+)
+@click.option(
+    "--output",
+    "output",
+    required=True,
+    type=click.Path(dir_okay=False),
+    help="Output file path.",
+)
+def audit_export(config: str, fmt: str, output: str) -> None:
+    """Export the full audit log to JSONL or CSV for SIEM ingestion."""
+    from agentguard.audit_log import AuditLog
+
+    cfg = _load_config(config)
+    log = AuditLog(db_path=cfg.audit_db_path)
+    dest = Path(os.path.expanduser(os.path.expandvars(output)))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == "jsonl":
+        count = log.export_jsonl(dest)
+    else:
+        count = log.export_csv(dest)
+
+    console.print(f"[green]Wrote {count} events to {dest}[/green]")
 
 
 @audit.command(name="verify")
