@@ -11,8 +11,12 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Optional
+
+AGENTGUARD_MCP_VERSION = "0.1.0"
+MCP_PROTOCOL_VERSION = "2025-03-26"
 
 from agentguard.audit_log import AuditLog
 from agentguard.config import AgentGuardConfig
@@ -67,7 +71,13 @@ class StdioServer:
         self._upstream_proc: Optional[subprocess.Popen[bytes]] = None
 
     async def run(self) -> None:
-        """Run the stdio server event loop."""
+        """Run the stdio server event loop.
+
+        stdin is read in a worker thread because asyncio.connect_read_pipe
+        on Windows ProactorEventLoop rejects non-overlapped HANDLEs
+        (WinError 6). The worker drops decoded lines on an asyncio Queue
+        that the main loop awaits.
+        """
         logger.info(
             "AgentGuard starting in %s mode. Audit DB: %s",
             self.mode.value,
@@ -86,21 +96,32 @@ class StdioServer:
                     stderr=subprocess.PIPE,
                 )
 
-        loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
-        await self._process_loop(reader)
+        def reader_thread() -> None:
+            try:
+                for line in sys.stdin:
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(line.rstrip("\r\n")), loop
+                    )
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
-    async def _process_loop(self, reader: asyncio.StreamReader) -> None:
+        t = threading.Thread(target=reader_thread, daemon=True)
+        t.start()
+
+        await self._process_loop(queue)
+
+    async def _process_loop(self, queue: "asyncio.Queue[Optional[str]]") -> None:
         """Main message processing loop."""
         while True:
             try:
-                line = await reader.readline()
-                if not line:
+                line = await queue.get()
+                if line is None:
                     break
-                await self._handle_message(line.decode().strip())
+                if line.strip():
+                    await self._handle_message(line.strip())
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -119,10 +140,49 @@ class StdioServer:
         method = msg.get("method", "")
         params = msg.get("params", {})
 
-        # Handle initialize — extract identity
+        # Handle initialize — extract identity first, then respond.
         if method == "initialize":
             self.proxy.handle_initialize(params)
-            self._forward_to_upstream(raw)
+            if self._upstream_proc is not None:
+                self._forward_to_upstream(raw)
+            else:
+                self._write_response({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                        "serverInfo": {
+                            "name": "agentguard",
+                            "version": AGENTGUARD_MCP_VERSION,
+                        },
+                    },
+                })
+            return
+
+        # With no upstream configured, every request past initialize gets a
+        # minimal synthesized response so the MCP client handshake doesn't hang.
+        # Tools/list returns empty; everything else returns an empty result.
+        if self._upstream_proc is None:
+            if method == "tools/list":
+                self._write_response({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {"tools": []},
+                })
+            elif method in ("resources/list", "prompts/list"):
+                key = "resources" if method == "resources/list" else "prompts"
+                self._write_response({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {key: []},
+                })
+            elif msg.get("id") is not None:
+                self._write_response({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "result": {},
+                })
             return
 
         # Handle tools/call — full policy + detector stack
@@ -156,7 +216,6 @@ class StdioServer:
 
         # Handle tools/list — scan tool descriptions
         if method == "tools/list":
-            # Forward first, then scan the response
             self._forward_to_upstream(raw)
             return
 
