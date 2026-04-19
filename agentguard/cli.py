@@ -436,6 +436,44 @@ def policy_check(file: str, mode: str) -> None:
         console.print(f"[bold green]Policy file is valid:[/bold green] {file}")
 
 
+@cli.command(
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True}
+)
+@click.argument("command_path", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def help(ctx: click.Context, command_path: tuple[str, ...]) -> None:
+    """Show help for agentguard or a subcommand.
+
+    Examples:
+
+      agentguard help
+      agentguard help audit
+      agentguard help audit tail
+      agentguard help run
+    """
+    target = cli
+    resolved: list[str] = []
+    for token in command_path:
+        if isinstance(target, click.Group):
+            nxt = target.get_command(ctx, token)
+            if nxt is None:
+                err_console.print(
+                    f"[red]Unknown command:[/red] agentguard {' '.join(resolved + [token])}"
+                )
+                err_console.print("Try: [bold]agentguard help[/bold]")
+                sys.exit(2)
+            target = nxt
+            resolved.append(token)
+        else:
+            err_console.print(
+                f"[red]'{' '.join(resolved)}' takes no subcommands[/red]"
+            )
+            sys.exit(2)
+
+    with click.Context(target, info_name=" ".join(["agentguard", *resolved])) as sub_ctx:
+        click.echo(target.get_help(sub_ctx))
+
+
 @cli.command()
 def version() -> None:
     """Show AgentGuard version information."""
