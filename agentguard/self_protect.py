@@ -136,12 +136,25 @@ _SELF_COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 def _normalize_path(p: str) -> str:
-    """Expand ~ and env vars, collapse separators, case-fold.
+    """Expand ~ and env vars, resolve symlinks, collapse separators, case-fold.
 
     Path comparison is case-insensitive because Windows filesystems are
     case-insensitive and we never want a trivial case-swap to slip past.
+
+    AG-BL-004: the earlier implementation used literal path comparison
+    which meant a symlink like ``/tmp/shortcut -> ~/.agentguard`` or a
+    hardlinked ``audit.db`` bypassed the guard entirely. We now resolve
+    real paths for both the candidate and every protected needle before
+    comparison. Paths that can't be resolved fall back to normalized
+    form so we never fail-open on a nonexistent path.
     """
     s = os.path.expandvars(os.path.expanduser(p))
+    try:
+        # realpath() resolves symlinks on POSIX and reparse points on
+        # modern Windows. On targets that don't exist it still canonicalizes.
+        s = os.path.realpath(s)
+    except (OSError, ValueError):
+        pass
     s = s.replace("\\", "/")
     s = re.sub(r"/+", "/", s)
     return s.rstrip("/").casefold()

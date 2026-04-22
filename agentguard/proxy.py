@@ -76,6 +76,25 @@ class ProxyCore:
         self._current_identity: Optional[AgentIdentity] = None
         self._approval_manager = ApprovalManager(default_approvals_dir())
 
+        # AG-BL-004: make sure the live audit DB path is always in the
+        # self-protection extra_paths set. realpath is applied inside the
+        # classifier so symlinks and hardlinks still route to the same
+        # protected needle. Operators who configure a custom
+        # audit_db_path outside ~/.agentguard/ get the same guard.
+        self._effective_extra_paths: list[str] = list(
+            self.config.self_protection.extra_paths or []
+        )
+        try:
+            import os as _os
+            self._effective_extra_paths.append(
+                _os.path.realpath(str(self.config.audit_db_path))
+            )
+            self._effective_extra_paths.append(
+                _os.path.realpath(str(self.config.audit_db_path.parent))
+            )
+        except Exception:
+            self._effective_extra_paths.append(str(self.config.audit_db_path))
+
     def handle_initialize(self, params: dict[str, Any]) -> None:
         """Process an MCP initialize request to extract agent identity."""
         self._current_identity = self._identity_extractor.extract_from_initialize(params)
@@ -334,7 +353,7 @@ class ProxyCore:
             return None
 
         result = classify_self_reference(
-            tool_name, tool_args, self.config.self_protection.extra_paths
+            tool_name, tool_args, self._effective_extra_paths
         )
         if result.kind is ReferenceKind.NONE:
             return None
