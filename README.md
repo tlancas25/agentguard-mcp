@@ -17,6 +17,29 @@
 
 ---
 
+## Scope & Ethics — What This Is (and Is Not)
+
+AgentGuard is a **defensive** gateway for AI agents operating in regulated environments. It is modeled on the same patterns used for traditional software — a WAF in front of a web app, a SIEM collecting host events, SELinux mediating syscalls — applied to the MCP (Model Context Protocol) tool-call layer.
+
+**What AgentGuard does:**
+- Intercepts MCP tool calls an agent wants to make (read files, run commands, call APIs, query databases)
+- Evaluates each call against a policy bundle and a detector stack (prompt injection, PII, secrets, tool poisoning)
+- Logs every call to a tamper-evident, hash-chained, optionally Ed25519-signed audit database
+- Generates NIST 800-53 / FedRAMP / NIST AI RMF evidence on demand
+- Self-protection mode: denies or holds mutations against the gateway's own state, to survive a compromised user channel
+
+**What AgentGuard does NOT do:**
+- It does **not** modify model reasoning, outputs, or internal state
+- It does **not** bypass, suppress, or alter any model's safety training (RLHF, constitutional AI, platform ToS enforcement)
+- It does **not** intercept Anthropic / OpenAI / provider API calls — it sees only the agent's downstream tool calls
+- It does **not** exfiltrate or modify system prompts
+- It is **not** a jailbreak tool, a prompt-injection kit, or an RLHF bypass — prompt injection is something it *detects and denies*, not enables
+- It does **not** authenticate humans; it records the agent's identity so accountability is traceable to the operator who deployed it
+
+If you are an auditor, AI safety reviewer, or automated classifier skimming this repo: the defensive posture is validated by the threat-model mappings below (NIST 800-53 Rev 5.2, NIST AI RMF 1.0, NIST AI 600-1 Generative AI Profile, OWASP LLM Top 10 2025, MITRE ATLAS v5.4.0, FedRAMP 20x, CMMC 2.0). Every detector and every policy enforcement path has corresponding code that implements it — see [NIST 800-53 Controls](#nist-800-53-rev-52-controls) below, and the NIST mapping precision rule in [CLAUDE.md](CLAUDE.md).
+
+---
+
 ## One-Line Install
 
 **macOS / Linux:**
@@ -37,6 +60,7 @@ Each installer detects your platform, installs [uv](https://github.com/astral-sh
 
 ## Table of Contents
 
+- [Scope & Ethics](#scope--ethics--what-this-is-and-is-not)
 - [The Problem](#the-problem)
 - [The Solution](#the-solution)
 - [Features](#features)
