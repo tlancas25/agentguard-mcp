@@ -161,19 +161,43 @@ def _normalize_path(p: str) -> str:
 
 
 def default_protected_paths() -> list[str]:
-    """Always-on protected set.
+    """Always-on protected set, normalized for string comparison."""
+    return [_normalize_path(p) for p in _raw_default_protected_paths()]
 
-    Deliberately narrow: only AgentGuard's own home directory. Operators
-    add extras via ``self_protection.extra_paths`` or
-    ``AGENTGUARD_SELF_PROTECT_EXTRA_PATHS``.
-    """
+
+def _raw_default_protected_paths() -> list[str]:
+    """Original (un-normalized) protected paths for inode-layer checks."""
     from agentguard.config import DEFAULT_AGENTGUARD_HOME
 
-    return [_normalize_path(str(DEFAULT_AGENTGUARD_HOME))]
+    return [str(DEFAULT_AGENTGUARD_HOME)]
+
+
+def _inode_matches(candidate: str, needle: str) -> bool:
+    """Compare (st_dev, st_ino) of two paths, treating missing paths as mismatch.
+
+    AG-BL-004.R5a: ``os.path.realpath`` collapses symlinks but NOT
+    hardlinks, so an attacker who runs ``os.link(audit.db, alias.db)``
+    can reference the alias and slip past a string-based path guard.
+    Inode-pair comparison catches this: a hardlinked alias points to
+    the same (st_dev, st_ino) as the original.
+    """
+    try:
+        cand_exp = os.path.expandvars(os.path.expanduser(candidate))
+        need_exp = os.path.expandvars(os.path.expanduser(needle))
+        if not os.path.exists(cand_exp) or not os.path.exists(need_exp):
+            return False
+        cs = os.stat(cand_exp)
+        ns = os.stat(need_exp)
+    except OSError:
+        return False
+    # Some Windows filesystems return st_ino == 0 — don't false-positive.
+    if cs.st_ino == 0 or ns.st_ino == 0:
+        return False
+    return cs.st_dev == ns.st_dev and cs.st_ino == ns.st_ino
 
 
 def _path_hit(candidate: str, needle: str) -> bool:
-    """Does the tool-call string reference the protected path?"""
+    """Does the tool-call string reference the protected path (string layer)?"""
     norm_c = _normalize_path(candidate)
     if not norm_c or not needle:
         return False
@@ -182,6 +206,24 @@ def _path_hit(candidate: str, needle: str) -> bool:
     if norm_c.startswith(needle + "/"):
         return True
     return needle in norm_c
+
+
+def _extract_path_tokens(raw: str) -> list[str]:
+    """Best-effort extraction of filesystem paths embedded in a string.
+
+    A tool argument might be ``rm -rf /path/to/file``; we need the raw
+    "/path/to/file" token to stat it for inode comparison. Splitting
+    on whitespace + keeping tokens that contain path separators covers
+    most shell-command shapes without building a full parser.
+    """
+    candidates: list[str] = [raw]
+    for piece in re.split(r"[\s'\"]+", raw):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "/" in piece or (len(piece) > 2 and piece[1:3] in (":/", ":\\")):
+            candidates.append(piece)
+    return candidates
 
 
 def _detect_mutation(tool_name: str, candidates: list[str]) -> Optional[str]:
@@ -234,12 +276,21 @@ def classify_self_reference(
                             present (destructive tool name, denylist regex,
                             or SQL write verb).
     """
-    protected = list(default_protected_paths())
+    # Keep two views of the protected set: normalized strings for the
+    # string-layer compare, and the ORIGINAL paths (expanded) for the
+    # inode-layer compare that backstops hardlink bypass (AG-BL-004.R5a).
+    protected: list[str] = list(default_protected_paths())
+    protected_raw: list[str] = [
+        os.path.expandvars(os.path.expanduser(str(p)))
+        for p in _raw_default_protected_paths()
+    ]
     if extra_paths:
         for extra in extra_paths:
             if extra:
                 protected.append(_normalize_path(extra))
+                protected_raw.append(os.path.expandvars(os.path.expanduser(extra)))
     protected = list(dict.fromkeys(p for p in protected if p))
+    protected_raw = list(dict.fromkeys(p for p in protected_raw if p))
 
     candidates: list[str] = [tool_name] if isinstance(tool_name, str) else []
     candidates.extend(s for s in iter_strings(tool_args) if isinstance(s, str))
@@ -269,6 +320,24 @@ def classify_self_reference(
                 break
         if path_hit:
             break
+
+    # 1b. Inode-layer fallback: attacker created a hardlink to a
+    # protected file and passed the alias path. String compare missed;
+    # os.stat + (st_dev, st_ino) catches it (AG-BL-004.R5a).
+    if path_hit is None:
+        for raw in candidates:
+            if not isinstance(raw, str):
+                continue
+            for token in _extract_path_tokens(raw):
+                for needle_raw in protected_raw:
+                    if _inode_matches(token, needle_raw):
+                        path_hit = _normalize_path(needle_raw)
+                        offending_arg = raw
+                        break
+                if path_hit:
+                    break
+            if path_hit:
+                break
 
     if path_hit is None:
         return SelfProtectResult(kind=ReferenceKind.NONE)

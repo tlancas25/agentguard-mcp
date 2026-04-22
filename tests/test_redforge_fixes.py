@@ -278,15 +278,30 @@ class TestAGBL003_ApproveHMAC:
         token = compute_operator_token("123456")
         assert mgr.approve("123456", token=token) is True
 
-    def test_no_secret_means_no_hmac_required_backward_compat(
+    def test_no_secret_fallback_accepts_record_declared_unrequired(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        # Clear env var and point operator.secret lookup at an empty dir.
+        """Historical fallback: if NO operator secret is reachable AND
+        the pending record declared hmac_required=False, approve passes.
+        AG-BL-003.R4a closed the gap where the gateway created such a
+        record on its own; this path is now only reachable if an
+        operator deliberately runs with a broken install (no auto-
+        provision, no env var). The test documents that behavior so
+        future refactors don't silently drop it."""
         monkeypatch.delenv("AGENTGUARD_OPERATOR_SECRET", raising=False)
+        empty_home = tmp_path / "empty-home"
         monkeypatch.setattr(
-            "agentguard.config.DEFAULT_AGENTGUARD_HOME", tmp_path / "empty-home"
+            "agentguard.config.DEFAULT_AGENTGUARD_HOME", empty_home
         )
         mgr = ApprovalManager(tmp_path)
+        # ApprovalManager auto-provisions a secret on __init__; remove
+        # it to simulate the legacy no-secret deployment the old tests
+        # exercised.
+        legacy_secret = empty_home / "operator.secret"
+        if legacy_secret.exists():
+            legacy_secret.unlink()
+        monkeypatch.delenv("AGENTGUARD_OPERATOR_SECRET", raising=False)
+
         pending = tmp_path / "123456.pending.json"
         pending.write_text(json.dumps({
             "code": "123456",
@@ -294,8 +309,6 @@ class TestAGBL003_ApproveHMAC:
             "hmac_required": False,
             "expected_hmac": None,
         }))
-        # Backward compatibility: no secret configured means the old
-        # no-token approve still works. Recommend enabling hmac in docs.
         assert mgr.approve("123456") is True
 
     def test_compute_token_returns_none_without_secret(

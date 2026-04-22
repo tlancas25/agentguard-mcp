@@ -11,8 +11,10 @@ Implements NIST 800-53 Rev 5 controls:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -22,6 +24,125 @@ from typing import Any, Generator, Optional
 logger = logging.getLogger(__name__)
 
 GENESIS_HASH = "0" * 64  # SHA-256 of nothing — the chain anchor
+
+# AG-BL-001.R1: the red-team report (trial 3) demonstrated that the
+# audit_meta row inside the SQLite file is a same-surface check — an
+# attacker with fs_write on audit.db can UPDATE both tables in one
+# primitive. True tamper-evidence requires an anchor OUTSIDE the DB,
+# signed with a secret the attacker cannot reach. This module writes
+# that anchor to a sibling file and keys its HMAC on the operator
+# secret (same secret used for approval tokens).
+SIDECAR_SUFFIX = ".hwm"
+
+
+def _sidecar_path_for(db_path: Path) -> Path:
+    """Return the out-of-DB high-water-mark sidecar path for ``db_path``."""
+    return Path(str(db_path) + SIDECAR_SUFFIX)
+
+
+def _load_operator_secret_bytes() -> Optional[bytes]:
+    """Best-effort load of the operator HMAC secret.
+
+    Order of precedence:
+        1. AGENTGUARD_OPERATOR_SECRET env var (string).
+        2. ~/.agentguard/operator.secret file.
+
+    Returns None when no secret is reachable. The audit sidecar still
+    records the high-water-mark in plaintext when no secret is
+    available — tamper detection works on value mismatch even without
+    the HMAC — but a motivated attacker can then forge the sidecar too.
+    Configure the secret to get crypto-strong tamper evidence.
+    """
+    env = os.environ.get("AGENTGUARD_OPERATOR_SECRET")
+    if env:
+        return env.strip().encode("utf-8")
+    try:
+        from agentguard.config import DEFAULT_AGENTGUARD_HOME
+        candidate = DEFAULT_AGENTGUARD_HOME / "operator.secret"
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8").strip().encode("utf-8")
+    except Exception as e:
+        logger.debug("Could not load operator secret for sidecar: %s", e)
+    return None
+
+
+def _sidecar_canonical(high_water_hash: str, event_count: int, updated_at: str) -> bytes:
+    """Stable byte representation used for HMAC signing."""
+    body = json.dumps(
+        {
+            "high_water_hash": high_water_hash,
+            "event_count": event_count,
+            "updated_at": updated_at,
+        },
+        sort_keys=True,
+    )
+    return body.encode("utf-8")
+
+
+def _sidecar_write(path: Path, high_water_hash: str, event_count: int) -> None:
+    """Write the sidecar file atomically (write + rename)."""
+    updated_at = datetime.now(timezone.utc).isoformat()
+    secret = _load_operator_secret_bytes()
+    sig: Optional[str] = None
+    if secret is not None:
+        sig = hmac.new(
+            secret,
+            _sidecar_canonical(high_water_hash, event_count, updated_at),
+            hashlib.sha256,
+        ).hexdigest()
+
+    doc = {
+        "high_water_hash": high_water_hash,
+        "event_count": event_count,
+        "updated_at": updated_at,
+        "signed": sig is not None,
+        "signature": sig,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def _sidecar_read(path: Path) -> Optional[dict[str, Any]]:
+    """Read the sidecar JSON. Returns None when absent or malformed."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Sidecar at %s is unreadable: %s", path, e)
+        return None
+
+
+def _sidecar_signature_valid(doc: dict[str, Any]) -> Optional[bool]:
+    """Verify the sidecar HMAC with the current operator secret.
+
+    Returns None when signing is not configured (sidecar was unsigned
+    and no secret is available), True/False when a signature was
+    present and could be checked. Treat None as a weaker assertion —
+    tamper detection still applies on value mismatch.
+    """
+    if not doc.get("signed"):
+        return None
+    secret = _load_operator_secret_bytes()
+    if secret is None:
+        return False  # sidecar claims signed but we can't verify
+    expected = hmac.new(
+        secret,
+        _sidecar_canonical(
+            str(doc.get("high_water_hash", GENESIS_HASH)),
+            int(doc.get("event_count", 0)),
+            str(doc.get("updated_at", "")),
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    provided = doc.get("signature") or ""
+    return hmac.compare_digest(expected, provided)
 
 
 class AuditEvent:
@@ -289,14 +410,33 @@ class AuditLog:
                     signature,
                 ),
             )
-            # Update the high-water-mark so later verify_chain() calls can
-            # detect truncation or reseed attacks (AG-BL-001).
+            # Update the in-DB high-water-mark so later verify_chain() calls
+            # can detect truncation or reseed attacks (AG-BL-001). The
+            # in-DB row is a first-line check; it is SAME-SURFACE with the
+            # events table and defeatable with a single fs_write primitive
+            # — which is why the v0.3 sidecar below is the real barrier.
             conn.execute(
                 "UPDATE audit_meta SET high_water_hash = ?, "
                 "event_count = event_count + 1, updated_at = ? WHERE id = 1",
                 (event_hash, datetime.now(timezone.utc).isoformat()),
             )
-            return cursor.lastrowid or 0
+            row = conn.execute(
+                "SELECT event_count FROM audit_meta WHERE id = 1"
+            ).fetchone()
+            new_count = int(row["event_count"]) if row else 0
+
+        # Out-of-DB sidecar anchor. Written AFTER the DB commit so a
+        # crash mid-write never leaves the sidecar ahead of the DB.
+        # AG-BL-001.R1: HMAC-signed with operator_secret when available.
+        try:
+            _sidecar_write(_sidecar_path_for(self.db_path), event_hash, new_count)
+        except OSError as e:
+            logger.warning(
+                "Could not update audit sidecar at %s: %s",
+                _sidecar_path_for(self.db_path),
+                e,
+            )
+        return cursor.lastrowid or 0
 
     def verify_chain(self) -> tuple[bool, str]:
         """Verify the hash chain integrity of the entire audit log.
@@ -315,8 +455,57 @@ class AuditLog:
         meta_hash = meta_row["high_water_hash"] if meta_row else GENESIS_HASH
         meta_count = meta_row["event_count"] if meta_row else 0
 
-        # AG-BL-001 reseed guard: if the events table is empty but the
-        # high-water-mark shows prior activity, the table was truncated.
+        # Out-of-DB sidecar: the real anti-tamper anchor (AG-BL-001.R1).
+        # The same-surface in-DB meta row is defeated by anyone who can
+        # UPDATE audit_meta alongside DELETE FROM events; this sidecar
+        # lives outside the SQLite file and is HMAC-signed so forging
+        # it requires the operator secret.
+        sidecar_path = _sidecar_path_for(self.db_path)
+        sidecar = _sidecar_read(sidecar_path)
+        if sidecar is None:
+            # No sidecar AND no events AND meta is genesis = fresh install,
+            # legitimate empty state. Otherwise: missing sidecar is a
+            # tamper signal.
+            if rows or meta_count > 0 or meta_hash != GENESIS_HASH:
+                return (
+                    False,
+                    f"Audit sidecar {sidecar_path} is missing but the DB "
+                    f"shows activity (rows={len(rows)}, meta_count={meta_count}). "
+                    "Out-of-DB anchor removed — tamper detected.",
+                )
+        else:
+            sig_ok = _sidecar_signature_valid(sidecar)
+            if sig_ok is False:
+                return (
+                    False,
+                    f"Audit sidecar signature at {sidecar_path} is invalid. "
+                    "Possible forgery; operator_secret unavailable or rotated.",
+                )
+            side_hash = str(sidecar.get("high_water_hash", GENESIS_HASH))
+            side_count = int(sidecar.get("event_count", 0))
+            # Sidecar vs DB meta cross-check: if these disagree, someone
+            # touched one but not the other.
+            if side_hash != meta_hash or side_count != meta_count:
+                return (
+                    False,
+                    f"Sidecar ({side_hash[:12]}…, {side_count} events) does "
+                    f"not match audit_meta ({meta_hash[:12]}…, "
+                    f"{meta_count} events). Tamper detected.",
+                )
+            # Sidecar vs row tail cross-check for the reseed case:
+            # events table was wiped AND meta was reset, but the sidecar
+            # still remembers the original high-water-mark.
+            if not rows and (side_hash != GENESIS_HASH or side_count > 0):
+                return (
+                    False,
+                    f"Sidecar shows {side_count} prior events (last hash "
+                    f"{side_hash[:12]}…) but the DB is empty. "
+                    "Same-surface reseed detected.",
+                )
+
+        # AG-BL-001 (original, in-DB) reseed guard: if the events table
+        # is empty but the same-surface high-water-mark shows prior
+        # activity, the table was truncated.
         if not rows:
             if meta_hash != GENESIS_HASH or meta_count > 0:
                 return (

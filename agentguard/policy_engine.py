@@ -62,6 +62,27 @@ def _tool_name_contains_invisible(tool_name: str) -> bool:
     return bool(_CONTROL_CHAR_RE.search(tool_name))
 
 
+def _tool_name_is_confusable(tool_name: str) -> bool:
+    """True if tool_name contains non-ASCII characters after NFKC.
+
+    AG-MT-001.OPEN: NFKC normalization preserves Cyrillic / Greek /
+    fullwidth-ASCII homoglyphs (``ѕhell``, ``ｓhell``, etc.), letting an
+    attacker sidestep an ASCII denylist. Legitimate MCP tool names are
+    ASCII — reject anything else in federal and standard postures.
+    Operators who really need non-ASCII names can add them to an
+    allowlist rule with the exact codepoints spelled out, which fails
+    closed by default.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return False
+    normalized = nfkc_stripped(tool_name)
+    try:
+        normalized.encode("ascii")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
 @dataclass
 class Decision:
     """The result of evaluating a tool call against policy."""
@@ -211,8 +232,8 @@ class PolicyEngine:
         """Evaluate a single bundle. Returns Decision or None if no match."""
 
         # AG-MT-001 evasion guard: refuse tool names containing zero-width
-        # or control characters outright. Legitimate MCP tool names never
-        # contain these; their presence is an evasion signal.
+        # or control characters, OR non-ASCII homoglyphs. Legitimate MCP
+        # tool names never use those; their presence is an evasion signal.
         if _tool_name_contains_invisible(tool_name):
             action = ACTION_DENY if self.mode == Mode.FEDERAL else ACTION_LOG
             return Decision(
@@ -222,6 +243,19 @@ class PolicyEngine:
                     "characters; refused as likely denylist evasion."
                 ),
                 matched_rule=f"invisible_char_reject:{bundle.name}",
+                nist_controls=["AC-3", "SI-10"],
+                policy_bundle=bundle.name,
+            )
+        if _tool_name_is_confusable(tool_name):
+            action = ACTION_DENY if self.mode == Mode.FEDERAL else ACTION_LOG
+            return Decision(
+                action=action,
+                reason=(
+                    f"Tool name {tool_name!r} contains non-ASCII "
+                    "characters after NFKC normalization; refused as "
+                    "likely confusable/homoglyph evasion."
+                ),
+                matched_rule=f"confusable_reject:{bundle.name}",
                 nist_controls=["AC-3", "SI-10"],
                 policy_bundle=bundle.name,
             )
@@ -302,16 +336,28 @@ class PolicyEngine:
 
     @staticmethod
     def _match_rule(rule: dict[str, Any], tool_name: str, tool_args: dict[str, Any]) -> bool:
-        """Return True if a rule matches the given tool call."""
-        # Match by tool name
-        rule_tool = rule.get("tool")
-        if rule_tool and rule_tool != tool_name and rule_tool != "*":
-            return False
+        """Return True if a rule matches the given tool call.
 
-        # Match by tool name prefix
+        AG-MT-001.R3a: the earlier implementation compared ``rule_tool``
+        to ``tool_name`` with raw ``!=``, so a rule ``{tool: shell,
+        action: deny}`` would not fire for ``Shell``, ``SHELL``,
+        ``shell\u200b``, ``ｓhell``, etc. Normalize both sides with the
+        same pipeline denylists and allowlists use so the three
+        matching paths behave consistently.
+        """
+        # Match by tool name (case/NFKC/whitespace-normalized)
+        rule_tool = rule.get("tool")
+        if rule_tool and rule_tool != "*":
+            if _normalize_tool_name(rule_tool) != _normalize_tool_name(tool_name):
+                return False
+
+        # Match by tool name prefix (normalized on both sides too)
         rule_prefix = rule.get("tool_prefix")
-        if rule_prefix and not tool_name.startswith(rule_prefix):
-            return False
+        if rule_prefix:
+            norm_prefix = _normalize_tool_name(rule_prefix)
+            norm_name = _normalize_tool_name(tool_name)
+            if not norm_name.startswith(norm_prefix):
+                return False
 
         # Match by arg key presence
         required_args = rule.get("has_args", [])

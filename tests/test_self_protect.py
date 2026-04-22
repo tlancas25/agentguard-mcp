@@ -218,17 +218,26 @@ class TestModeStandard:
     def test_mutation_allowed_after_approval(self, tmp_path: Path, monkeypatch) -> None:
         approvals = tmp_path / "approvals"
         monkeypatch.setenv("AGENTGUARD_APPROVALS_DIR", str(approvals))
+        # Standard mode now requires an HMAC token on approve()
+        # (AG-BL-003.R4a/R4b). Pin a known secret so both the gateway
+        # and the approver thread compute matching tokens.
+        monkeypatch.setenv(
+            "AGENTGUARD_OPERATOR_SECRET", "unit-test-operator-secret"
+        )
         proxy = _proxy(tmp_path, "standard", timeout=3)
 
         approver_ready = threading.Event()
 
         def approver() -> None:
+            from agentguard.approvals import compute_operator_token as _tok
+
             mgr = ApprovalManager(approvals)
             deadline = time.time() + 2.5
             while time.time() < deadline:
                 pending = mgr.list_pending()
                 if pending:
-                    mgr.approve(pending[0]["code"])
+                    code = pending[0]["code"]
+                    mgr.approve(code, token=_tok(code))
                     approver_ready.set()
                     return
                 time.sleep(0.1)
@@ -270,15 +279,25 @@ class TestModeStrict:
 # ---------------------------------------------------------------------------
 
 class TestApprovalManager:
-    def test_list_approve_deny_cycle(self, tmp_path: Path) -> None:
+    def test_list_approve_deny_cycle(self, tmp_path: Path, monkeypatch) -> None:
+        # ApprovalManager now auto-provisions ~/.agentguard/operator.secret
+        # (AG-BL-003.R4a), so approve() requires an HMAC token computed
+        # against that secret. Point the lookup at a throw-away home.
+        fake_home = tmp_path / "home"
+        monkeypatch.setattr(
+            "agentguard.config.DEFAULT_AGENTGUARD_HOME", fake_home
+        )
+        monkeypatch.delenv("AGENTGUARD_OPERATOR_SECRET", raising=False)
+        from agentguard.approvals import compute_operator_token as _tok
+
         mgr = ApprovalManager(tmp_path)
         # Simulate a request by creating a pending file, then approve
         pending = tmp_path / "123456.pending.json"
         pending.write_text('{"code": "123456", "expires_at": 9999999999}')
         assert len(mgr.list_pending()) == 1
-        assert mgr.approve("123456") is True
+        assert mgr.approve("123456", token=_tok("123456")) is True
         assert (tmp_path / "123456.approved").exists()
-        assert mgr.approve("999999") is False
+        assert mgr.approve("999999", token=_tok("999999")) is False
 
     @pytest.mark.parametrize(
         "bad_code",
