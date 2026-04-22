@@ -42,7 +42,10 @@ from agentguard.self_protect import ReferenceKind, classify_self_reference
 
 class TestR1_SidecarAnchor:
     def _log(self, tmp_path: Path, monkeypatch) -> AuditLog:
-        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "test-sidecar-secret")
+        monkeypatch.setenv(
+            "AGENTGUARD_OPERATOR_SECRET",
+            "test-sidecar-secret-padded-to-32-bytes-min",
+        )
         priv, _ = generate_signing_keypair()
         return AuditLog(db_path=tmp_path / "audit.db", signing_key=priv)
 
@@ -185,7 +188,10 @@ class TestR4b_HmacFromCurrentAvailability:
         """Attacker creates a pending record with hmac_required=False.
         Gateway has an operator secret available RIGHT NOW, so approve
         must still require a valid token."""
-        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "some-operator-secret")
+        monkeypatch.setenv(
+            "AGENTGUARD_OPERATOR_SECRET",
+            "some-operator-secret-padded-to-32-bytes",
+        )
         mgr = ApprovalManager(tmp_path / "approvals")
         pending = (tmp_path / "approvals" / "123456.pending.json")
         pending.parent.mkdir(parents=True, exist_ok=True)

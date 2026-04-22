@@ -33,6 +33,51 @@ GENESIS_HASH = "0" * 64  # SHA-256 of nothing — the chain anchor
 # that anchor to a sibling file and keys its HMAC on the operator
 # secret (same secret used for approval tokens).
 SIDECAR_SUFFIX = ".hwm"
+INSTALL_RECEIPT_FILENAME = ".install-receipt"
+
+
+def _install_receipt_path_for(db_path: Path) -> Path:
+    """Location of the first-install receipt for a specific audit DB."""
+    return db_path.parent / INSTALL_RECEIPT_FILENAME
+
+
+def _ensure_install_receipt(db_path: Path) -> bool:
+    """Write a one-time install receipt if missing. Returns True if the
+    receipt EXISTED before this call (i.e., this is not the first boot).
+
+    AG-BL-001.V2 (trial 4): the prior design let an attacker run
+    ``rm ~/.agentguard/audit.db ~/.agentguard/audit.db.hwm`` and return
+    the gateway to a state indistinguishable from a fresh install — next
+    boot re-initialized empty, verify_chain returned PASS, the attacker
+    re-appended a forged chain. The install receipt is an out-of-band
+    marker: once written, its presence means "this install has existed
+    before." verify_chain refuses to treat an empty DB as legitimate
+    when the receipt predates the DB.
+    """
+    import secrets as _secrets
+
+    path = _install_receipt_path_for(db_path)
+    if path.exists():
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "install_uuid": _secrets.token_hex(16),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "version": "0.4.0",
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return False
+
+
+def _install_receipt_path() -> Path:
+    """Legacy global accessor kept for the self_protect helper."""
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME
+
+    return DEFAULT_AGENTGUARD_HOME / INSTALL_RECEIPT_FILENAME
 
 
 def _sidecar_path_for(db_path: Path) -> Path:
@@ -43,27 +88,19 @@ def _sidecar_path_for(db_path: Path) -> Path:
 def _load_operator_secret_bytes() -> Optional[bytes]:
     """Best-effort load of the operator HMAC secret.
 
-    Order of precedence:
-        1. AGENTGUARD_OPERATOR_SECRET env var (string).
-        2. ~/.agentguard/operator.secret file.
-
-    Returns None when no secret is reachable. The audit sidecar still
-    records the high-water-mark in plaintext when no secret is
-    available — tamper detection works on value mismatch even without
-    the HMAC — but a motivated attacker can then forge the sidecar too.
-    Configure the secret to get crypto-strong tamper evidence.
+    Delegates to ``agentguard.approvals._load_operator_secret`` so the
+    same minimum-entropy floor (MIN_OPERATOR_SECRET_BYTES) applies to
+    both approval tokens and audit sidecar signatures. Weak secrets are
+    rejected here too — sidecar writes without a valid key simply fall
+    back to unsigned, with verify_chain() requiring an operator secret
+    at verify time to validate signatures.
     """
-    env = os.environ.get("AGENTGUARD_OPERATOR_SECRET")
-    if env:
-        return env.strip().encode("utf-8")
     try:
-        from agentguard.config import DEFAULT_AGENTGUARD_HOME
-        candidate = DEFAULT_AGENTGUARD_HOME / "operator.secret"
-        if candidate.exists():
-            return candidate.read_text(encoding="utf-8").strip().encode("utf-8")
+        from agentguard.approvals import _load_operator_secret as _al
+        return _al()
     except Exception as e:
         logger.debug("Could not load operator secret for sidecar: %s", e)
-    return None
+        return None
 
 
 def _sidecar_canonical(high_water_hash: str, event_count: int, updated_at: str) -> bytes:
@@ -238,6 +275,14 @@ class AuditLog:
                 self._verifier = self._signer.public_key()
             except Exception as e:
                 logger.warning("Could not derive verify key from signing key: %s", e)
+
+        # AG-BL-001.V2: drop a one-time install receipt on first boot.
+        # verify_chain() later refuses to treat an empty DB as a valid
+        # fresh-install state if the receipt predates the DB.
+        try:
+            _ensure_install_receipt(self.db_path)
+        except OSError as e:
+            logger.warning("Could not write install receipt: %s", e)
 
         self._init_db()
 
@@ -513,6 +558,41 @@ class AuditLog:
                     f"Events table is empty but high-water-mark shows "
                     f"{meta_count} prior events (last hash {meta_hash[:12]}…). "
                     f"Truncation or reseed detected.",
+                )
+            # AG-BL-001.V2: factory-reset detector. Empty DB + empty
+            # sidecar is only a legitimate state on a BRAND-NEW install.
+            # If the install receipt shows this home was initialized
+            # earlier, someone deleted both the DB and the sidecar
+            # between then and now — fail closed.
+            receipt = _install_receipt_path_for(self.db_path)
+            try:
+                receipt_ctime = receipt.stat().st_mtime if receipt.exists() else None
+            except OSError:
+                receipt_ctime = None
+            # The receipt is written in __init__ of THIS AuditLog. If
+            # it predates every write to the DB file, we're inside a
+            # legitimate brand-new install. If it predates a deleted DB
+            # that existed before, we're looking at factory-reset.
+            try:
+                db_ctime = (
+                    self.db_path.stat().st_mtime if self.db_path.exists() else None
+                )
+            except OSError:
+                db_ctime = None
+            if (
+                receipt_ctime is not None
+                and db_ctime is not None
+                and receipt_ctime + 1 < db_ctime
+            ):
+                # Receipt predates the DB by more than a second → the DB
+                # was created after a prior install's receipt was already
+                # there. That's the factory-reset shape.
+                return (
+                    False,
+                    "Install receipt predates the current audit DB by more "
+                    "than one second. Factory-reset (rm audit.db audit.db.hwm) "
+                    "detected. Out-of-band anchor says this install has "
+                    "existed before.",
                 )
             return True, "Audit log is empty."
 

@@ -134,7 +134,7 @@ def cli() -> None:
     "--no-interactive",
     is_flag=True,
     default=False,
-    help="Skip the wizard; use defaults (self_protect=off) for scripted installs.",
+    help="Skip the wizard; use defaults (self_protect=standard) for scripted installs.",
 )
 def init(
     gen_key: bool,
@@ -179,33 +179,40 @@ def init(
         )
         console.print(f"[green]Created minimal {dest}[/green]")
 
-    # Self-protection prompt / flag
+    # Self-protection prompt / flag.
+    # AG-BL-001.V1 (trial 4 CRITICAL): the prior "off" default left
+    # operator.secret reachable by any agent with fs_read, which defeats
+    # every downstream defense. Default is now "standard" — reads of
+    # AgentGuard state are allowed and logged, mutations require an
+    # operator approval code. Operators who truly want unguarded dev
+    # can pass --self-protect off explicitly.
     sp_mode = self_protect_mode
     if sp_mode is None:
         if no_interactive or not sys.stdin.isatty():
-            sp_mode = "off"
+            sp_mode = "standard"
             console.print(
-                "[dim]Self-protection: [bold]off[/bold] "
-                "(non-interactive install; use --self-protect standard|strict to change)[/dim]"
+                "[dim]Self-protection: [bold]standard[/bold] "
+                "(non-interactive install; use --self-protect off|strict to change)[/dim]"
             )
         else:
             console.print(
                 "\n[bold]Self-protection[/bold]\n"
                 "Controls whether agents can modify or stop AgentGuard itself.\n"
-                "  [1] [bold]Off[/bold]      — agent has full access (DEFAULT)\n"
-                "  [2] Standard — reads logged; mutations need operator approval\n"
+                "  [1] Off      — agent has full access (dev convenience only)\n"
+                "  [2] [bold]Standard[/bold] — reads logged; mutations need operator approval (DEFAULT)\n"
                 "  [3] Strict   — any reference to ~/.agentguard/ denied outright"
             )
             choice = click.prompt(
-                "Pick a self-protection mode", default="1",
+                "Pick a self-protection mode", default="2",
                 show_default=True, type=click.Choice(["1", "2", "3"]),
             )
             sp_mode = {"1": "off", "2": "standard", "3": "strict"}[choice]
             console.print(f"[green]Self-protection: {sp_mode}[/green]")
 
-    # Patch the YAML if the chosen mode isn't the default off.
-    if sp_mode != "off":
-        _set_self_protection_mode_in_yaml(dest, sp_mode)
+    # Persist the chosen mode to the scaffolded YAML (even when it's
+    # the default "standard" — the explicit value avoids relying on the
+    # Pydantic default and makes the posture visible to readers).
+    _set_self_protection_mode_in_yaml(dest, sp_mode)
 
     console.print(
         f"[dim]Audit DB will be written to "

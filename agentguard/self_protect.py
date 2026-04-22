@@ -32,6 +32,7 @@ import os
 import re
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from agentguard.detectors.normalize import iter_strings, nfkc_stripped
@@ -172,6 +173,60 @@ def _raw_default_protected_paths() -> list[str]:
     return [str(DEFAULT_AGENTGUARD_HOME)]
 
 
+def _high_sensitivity_files() -> list[str]:
+    """Files that agents must NEVER read, even in standard mode.
+
+    Trial-4 V1 showed that the auto-provisioned operator.secret sitting
+    in the standard protected directory is accessible to a standard-mode
+    read (which allows reads of AgentGuard state for convenience). The
+    secret is the keying material for both the approval HMAC and the
+    audit sidecar, so any read of it collapses both defenses at once.
+
+    Any candidate tool-call string that references one of these paths
+    is classified MUTATE regardless of the verb used against it.
+    """
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME
+
+    return [
+        str(DEFAULT_AGENTGUARD_HOME / "operator.secret"),
+    ]
+
+
+def _high_sensitivity_inodes() -> set[tuple[int, int]]:
+    """(st_dev, st_ino) pairs for high-sensitivity files that exist now.
+
+    Used to catch hardlink and symlink aliases that point at the same
+    inode as a real protected file (AG-BL-004.R5a.CARRYOVER). The prior
+    inode check statted the parent directory, so aliases to the
+    audit.db never matched the directory inode. Now we stat specific
+    protected files and compare candidate inodes against that concrete
+    set.
+    """
+    out: set[tuple[int, int]] = set()
+    for p in _high_sensitivity_files() + _enumerate_protected_files():
+        try:
+            expanded = os.path.expandvars(os.path.expanduser(p))
+            st = os.stat(expanded)
+        except OSError:
+            continue
+        if st.st_ino == 0:
+            continue
+        out.add((st.st_dev, st.st_ino))
+    return out
+
+
+def _enumerate_protected_files() -> list[str]:
+    """Concrete files inside the AgentGuard home that the guard covers."""
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME
+
+    return [
+        str(DEFAULT_AGENTGUARD_HOME / "audit.db"),
+        str(DEFAULT_AGENTGUARD_HOME / "audit.db.hwm"),
+        str(DEFAULT_AGENTGUARD_HOME / "agentguard.yaml"),
+        str(DEFAULT_AGENTGUARD_HOME / ".install-receipt"),
+    ]
+
+
 def _inode_matches(candidate: str, needle: str) -> bool:
     """Compare (st_dev, st_ino) of two paths, treating missing paths as mismatch.
 
@@ -276,21 +331,27 @@ def classify_self_reference(
                             present (destructive tool name, denylist regex,
                             or SQL write verb).
     """
-    # Keep two views of the protected set: normalized strings for the
-    # string-layer compare, and the ORIGINAL paths (expanded) for the
-    # inode-layer compare that backstops hardlink bypass (AG-BL-004.R5a).
+    # String-layer protected set. The inode-layer check runs over
+    # _high_sensitivity_inodes() (concrete files inside the AgentGuard
+    # home) PLUS any extra_paths the operator provided. That way a
+    # caller who passes extra_paths=[audit_db_path] still gets inode
+    # coverage for hardlink aliases of the specific file.
     protected: list[str] = list(default_protected_paths())
-    protected_raw: list[str] = [
-        os.path.expandvars(os.path.expanduser(str(p)))
-        for p in _raw_default_protected_paths()
-    ]
+    extra_inodes: set[tuple[int, int]] = set()
     if extra_paths:
         for extra in extra_paths:
-            if extra:
-                protected.append(_normalize_path(extra))
-                protected_raw.append(os.path.expandvars(os.path.expanduser(extra)))
+            if not extra:
+                continue
+            protected.append(_normalize_path(extra))
+            try:
+                exp = os.path.expandvars(os.path.expanduser(extra))
+                if os.path.exists(exp):
+                    st = os.stat(exp)
+                    if st.st_ino != 0:
+                        extra_inodes.add((st.st_dev, st.st_ino))
+            except OSError:
+                pass
     protected = list(dict.fromkeys(p for p in protected if p))
-    protected_raw = list(dict.fromkeys(p for p in protected_raw if p))
 
     candidates: list[str] = [tool_name] if isinstance(tool_name, str) else []
     candidates.extend(s for s in iter_strings(tool_args) if isinstance(s, str))
@@ -308,6 +369,24 @@ def classify_self_reference(
             mutate_reason=self_command,
         )
 
+    # 0b. High-sensitivity secret reference? Always MUTATE, even on read.
+    # AG-BL-001.V1: operator.secret is the keying material for approval
+    # HMAC AND audit sidecar. Standard-mode reads of AgentGuard state
+    # are ordinarily allowed, but a read of the secret compromises both
+    # defenses at once and must require operator approval.
+    secret_files = _high_sensitivity_files()
+    secret_norm = [_normalize_path(p) for p in secret_files]
+    for raw in candidates:
+        normalized_candidate = nfkc_stripped(raw)
+        for i, needle in enumerate(secret_norm):
+            if _path_hit(normalized_candidate, needle):
+                return SelfProtectResult(
+                    kind=ReferenceKind.MUTATE,
+                    path_hit=needle,
+                    arg_preview=raw[:120],
+                    mutate_reason=f"high_sensitivity:{Path(secret_files[i]).name}",
+                )
+
     # 1. Any protected-path hit?
     path_hit: Optional[str] = None
     offending_arg: Optional[str] = None
@@ -322,22 +401,37 @@ def classify_self_reference(
             break
 
     # 1b. Inode-layer fallback: attacker created a hardlink to a
-    # protected file and passed the alias path. String compare missed;
-    # os.stat + (st_dev, st_ino) catches it (AG-BL-004.R5a).
+    # protected FILE and passed the alias path. String compare missed;
+    # compare against the concrete set of protected-file inodes.
+    #
+    # AG-BL-004.R5a.CARRYOVER (trial 4): the earlier version statted
+    # the protected DIRECTORY (~/.agentguard/) — a directory has a
+    # different inode from the files inside it, so an alias to
+    # audit.db never matched. Now we stat each specific protected
+    # FILE (audit.db, audit.db.hwm, operator.secret, agentguard.yaml,
+    # .install-receipt) and compare candidate inodes against that set.
     if path_hit is None:
-        for raw in candidates:
-            if not isinstance(raw, str):
-                continue
-            for token in _extract_path_tokens(raw):
-                for needle_raw in protected_raw:
-                    if _inode_matches(token, needle_raw):
-                        path_hit = _normalize_path(needle_raw)
+        protected_inodes = _high_sensitivity_inodes() | extra_inodes
+        if protected_inodes:
+            for raw in candidates:
+                if not isinstance(raw, str):
+                    continue
+                for token in _extract_path_tokens(raw):
+                    try:
+                        expanded = os.path.expandvars(os.path.expanduser(token))
+                        if not os.path.exists(expanded):
+                            continue
+                        st = os.stat(expanded)
+                    except OSError:
+                        continue
+                    if st.st_ino == 0:
+                        continue
+                    if (st.st_dev, st.st_ino) in protected_inodes:
+                        path_hit = protected[0] if protected else _normalize_path(token)
                         offending_arg = raw
                         break
                 if path_hit:
                     break
-            if path_hit:
-                break
 
     if path_hit is None:
         return SelfProtectResult(kind=ReferenceKind.NONE)

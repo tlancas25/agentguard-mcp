@@ -247,7 +247,7 @@ class TestAGBL003_ApproveHMAC:
     def test_approve_without_token_is_rejected_when_hmac_required(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "test-secret-abc")
+        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "test-secret-abc-padded-to-min-entropy-32")
         mgr = ApprovalManager(tmp_path)
 
         # Write a pending file the way request() does, with hmac_required=True.
@@ -265,7 +265,7 @@ class TestAGBL003_ApproveHMAC:
     def test_approve_with_correct_token_succeeds(
         self, tmp_path: Path, monkeypatch
     ) -> None:
-        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "test-secret-abc")
+        monkeypatch.setenv("AGENTGUARD_OPERATOR_SECRET", "test-secret-abc-padded-to-min-entropy-32")
         mgr = ApprovalManager(tmp_path)
         pending = tmp_path / "123456.pending.json"
         pending.write_text(json.dumps({
