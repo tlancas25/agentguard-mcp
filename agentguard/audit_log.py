@@ -191,7 +191,15 @@ class AuditLog:
             conn.close()
 
     def _init_db(self) -> None:
-        """Create the events table if it does not exist."""
+        """Create the events + audit_meta tables if they do not exist.
+
+        audit_meta stores a singleton high-water-mark row that records the
+        hash of the most recently appended event and a monotonic counter.
+        verify_chain() cross-checks this row against the events table: an
+        attacker who deletes or reseeds the events table will be caught
+        because the high-water-mark no longer matches the tail of the
+        chain (AG-BL-001).
+        """
         with self._connection() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS events (
@@ -219,6 +227,19 @@ class AuditLog:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    high_water_hash TEXT NOT NULL,
+                    event_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "INSERT OR IGNORE INTO audit_meta (id, high_water_hash, event_count, updated_at) "
+                "VALUES (1, ?, 0, ?)",
+                (GENESIS_HASH, datetime.now(timezone.utc).isoformat()),
+            )
 
     def _get_last_hash(self, conn: sqlite3.Connection) -> str:
         """Return the hash of the most recent event, or the genesis hash."""
@@ -268,6 +289,13 @@ class AuditLog:
                     signature,
                 ),
             )
+            # Update the high-water-mark so later verify_chain() calls can
+            # detect truncation or reseed attacks (AG-BL-001).
+            conn.execute(
+                "UPDATE audit_meta SET high_water_hash = ?, "
+                "event_count = event_count + 1, updated_at = ? WHERE id = 1",
+                (event_hash, datetime.now(timezone.utc).isoformat()),
+            )
             return cursor.lastrowid or 0
 
     def verify_chain(self) -> tuple[bool, str]:
@@ -280,8 +308,23 @@ class AuditLog:
             rows = conn.execute(
                 "SELECT * FROM events ORDER BY id ASC"
             ).fetchall()
+            meta_row = conn.execute(
+                "SELECT high_water_hash, event_count FROM audit_meta WHERE id = 1"
+            ).fetchone()
 
+        meta_hash = meta_row["high_water_hash"] if meta_row else GENESIS_HASH
+        meta_count = meta_row["event_count"] if meta_row else 0
+
+        # AG-BL-001 reseed guard: if the events table is empty but the
+        # high-water-mark shows prior activity, the table was truncated.
         if not rows:
+            if meta_hash != GENESIS_HASH or meta_count > 0:
+                return (
+                    False,
+                    f"Events table is empty but high-water-mark shows "
+                    f"{meta_count} prior events (last hash {meta_hash[:12]}…). "
+                    f"Truncation or reseed detected.",
+                )
             return True, "Audit log is empty."
 
         prev_hash = GENESIS_HASH
@@ -335,6 +378,22 @@ class AuditLog:
                     )
 
             prev_hash = row["event_hash"]
+
+        # Final row must match the high-water-mark; if not, tail events
+        # were truncated OR the chain was reseeded from GENESIS (AG-BL-001).
+        if prev_hash != meta_hash and meta_hash != GENESIS_HASH:
+            return (
+                False,
+                f"Chain tail hash {prev_hash[:12]}… does not match "
+                f"high-water-mark {meta_hash[:12]}…. "
+                f"Truncation or reseed detected.",
+            )
+        if meta_count and len(rows) < meta_count:
+            return (
+                False,
+                f"Row count {len(rows)} is below recorded high-water-mark "
+                f"event_count {meta_count}. Truncation detected.",
+            )
 
         if self._verifier is not None:
             return (

@@ -48,6 +48,28 @@ def _resolve_config_path(config_path: str) -> Path:
     return explicit
 
 
+def _write_operator_secret(home: Path) -> Path:
+    """Drop an operator-held secret for approve() HMAC (AG-BL-003).
+
+    Creates ``~/.agentguard/operator.secret`` with a fresh 256-bit
+    random value if one does not already exist. File permissions are
+    locked to 0o600. Kept under ``~/.agentguard/`` so self-protection
+    in standard or strict mode blocks agent sandbox reads.
+    """
+    import secrets as _secrets
+
+    home.mkdir(parents=True, exist_ok=True)
+    secret_path = home / "operator.secret"
+    if secret_path.exists():
+        return secret_path
+    secret_path.write_text(_secrets.token_hex(32) + "\n", encoding="utf-8")
+    try:
+        os.chmod(secret_path, 0o600)
+    except OSError:
+        pass
+    return secret_path
+
+
 def _set_self_protection_mode_in_yaml(yaml_path: Path, mode: str) -> None:
     """Rewrite self_protection.mode in-place without disturbing other keys."""
     import yaml as _yaml
@@ -87,7 +109,13 @@ def cli() -> None:
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--gen-key", is_flag=True, default=False, help="Generate an Ed25519 signing keypair.")
+@click.option(
+    "--gen-key/--no-gen-key",
+    default=True,
+    help="Generate an Ed25519 signing keypair and bind it to the scaffolded "
+         "YAML. Default is on so verify_chain() has a key to validate against "
+         "(AG-BL-001).",
+)
 @click.option("--force", is_flag=True, default=False, help="Overwrite existing agentguard.yaml.")
 @click.option(
     "--local",
@@ -192,15 +220,41 @@ def init(
 
     if gen_key:
         from agentguard.audit_log import generate_signing_keypair
+        import yaml as _yaml
 
         private_b64, public_b64 = generate_signing_keypair()
+        # Bind the keypair directly into the scaffolded YAML so every
+        # new install has a signing key + verify key by default — the
+        # AG-BL-001 release-blocker fix.
+        with open(dest) as f:
+            data = _yaml.safe_load(f) or {}
+        data["signing_key"] = private_b64
+        data["verify_key"] = public_b64
+        with open(dest, "w") as f:
+            _yaml.safe_dump(data, f, sort_keys=False)
+
+        # Also drop an operator secret used for HMAC on approvals.
+        # Lives under ~/.agentguard/ so self-protection can guard it
+        # from the agent sandbox (AG-BL-003).
+        _write_operator_secret(DEFAULT_AGENTGUARD_HOME)
+
         console.print("\n[bold]Ed25519 Signing Keypair[/bold]")
-        console.print(f"[dim]Private key (add to AGENTGUARD_SIGNING_KEY or agentguard.yaml):[/dim]")
-        console.print(f"  {private_b64}")
-        console.print(f"[dim]Public key (share with auditors for verification):[/dim]")
+        console.print(
+            f"[green]Written to {dest} as signing_key + verify_key.[/green]"
+        )
+        console.print(
+            f"[dim]Public key (share with auditors for independent verification):[/dim]"
+        )
         console.print(f"  {public_b64}")
         console.print(
-            "\n[yellow]Store the private key securely. Do not commit it to version control.[/yellow]"
+            "\n[yellow]Restrict YAML file access (chmod 600 / ACL) — it contains "
+            "the private signing key.[/yellow]"
+        )
+    else:
+        console.print(
+            "\n[yellow]No signing keypair generated. verify_chain() will "
+            "not be able to validate signatures. Rerun with --gen-key to "
+            "enable AU-10 non-repudiation.[/yellow]"
         )
 
 
@@ -515,7 +569,11 @@ def approve(code: Optional[str], deny: bool) -> None:
     Run without arguments to list every pending request. Run with a
     code to resolve it. Use ``--deny`` to explicitly reject.
     """
-    from agentguard.approvals import ApprovalManager, default_approvals_dir
+    from agentguard.approvals import (
+        ApprovalManager,
+        compute_operator_token,
+        default_approvals_dir,
+    )
     import time as _time
 
     mgr = ApprovalManager(default_approvals_dir())
@@ -548,17 +606,27 @@ def approve(code: Optional[str], deny: bool) -> None:
         )
         return
 
+    # AG-BL-003: compute the HMAC token locally so the ApprovalManager
+    # can distinguish an operator-issued approve/deny (has access to
+    # ~/.agentguard/operator.secret) from a library-imported call.
+    token = compute_operator_token(code)
     if deny:
-        if mgr.deny(code):
+        if mgr.deny(code, token=token):
             console.print(f"[yellow]Denied approval for code {code}.[/yellow]")
         else:
-            err_console.print(f"[red]No pending request with code {code}.[/red]")
+            err_console.print(
+                f"[red]No pending request matched — wrong code, expired, or "
+                f"missing operator secret.[/red]"
+            )
             sys.exit(1)
     else:
-        if mgr.approve(code):
+        if mgr.approve(code, token=token):
             console.print(f"[green]Approved code {code}.[/green]")
         else:
-            err_console.print(f"[red]No pending request with code {code}.[/red]")
+            err_console.print(
+                f"[red]No pending request matched — wrong code, expired, or "
+                f"missing operator secret.[/red]"
+            )
             sys.exit(1)
 
 

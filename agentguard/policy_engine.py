@@ -12,19 +12,54 @@ NIST 800-53 controls addressed:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
+from agentguard.detectors.normalize import ZERO_WIDTH_CHARS, nfkc_stripped
 from agentguard.modes import Mode
+
+# Characters an attacker might splice into a tool name to dodge exact
+# allowlist/denylist comparison. We reject any tool_name that contains
+# zero-width / control chars after normalization — a bare-naked
+# "fire_missile" and "fire\u200bmissile" must not both evaluate to the
+# same cleaned string unless the normalization pipeline strips the
+# invisible glyph first. (AG-MT-001)
+_ZERO_WIDTH_SET = set(ZERO_WIDTH_CHARS)
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]")
 
 logger = logging.getLogger(__name__)
 
 ACTION_ALLOW = "allow"
 ACTION_DENY = "deny"
 ACTION_LOG = "log"
+
+
+def _normalize_tool_name(tool_name: str) -> str:
+    """Return the canonical form used for allowlist/denylist comparison.
+
+    Strips zero-widths, applies NFKC normalization, casefolds, and trims
+    surrounding whitespace. Mirrors the approach self_protect uses for
+    path comparison so ``Shell``, ``SHELL``, ``shell`` (trailing space),
+    ``shell\u200b`` (ZWSP), and ``ｓhell`` (fullwidth) all collapse to
+    the same key.
+    """
+    if not isinstance(tool_name, str):
+        return ""
+    return nfkc_stripped(tool_name).strip().casefold()
+
+
+def _tool_name_contains_invisible(tool_name: str) -> bool:
+    """True if tool_name has zero-width or control chars — likely evasion."""
+    if not isinstance(tool_name, str):
+        return False
+    for ch in tool_name:
+        if ch in _ZERO_WIDTH_SET:
+            return True
+    return bool(_CONTROL_CHAR_RE.search(tool_name))
 
 
 @dataclass
@@ -175,8 +210,28 @@ class PolicyEngine:
     ) -> Optional[Decision]:
         """Evaluate a single bundle. Returns Decision or None if no match."""
 
+        # AG-MT-001 evasion guard: refuse tool names containing zero-width
+        # or control characters outright. Legitimate MCP tool names never
+        # contain these; their presence is an evasion signal.
+        if _tool_name_contains_invisible(tool_name):
+            action = ACTION_DENY if self.mode == Mode.FEDERAL else ACTION_LOG
+            return Decision(
+                action=action,
+                reason=(
+                    f"Tool name {tool_name!r} contains zero-width or control "
+                    "characters; refused as likely denylist evasion."
+                ),
+                matched_rule=f"invisible_char_reject:{bundle.name}",
+                nist_controls=["AC-3", "SI-10"],
+                policy_bundle=bundle.name,
+            )
+
+        normalized_tool = _normalize_tool_name(tool_name)
+        denylist_norm = {_normalize_tool_name(t) for t in bundle.tool_denylist}
+        allowlist_norm = {_normalize_tool_name(t) for t in bundle.tool_allowlist}
+
         # 1. Explicit denylist
-        if tool_name in bundle.tool_denylist:
+        if normalized_tool in denylist_norm:
             action = ACTION_DENY if self.mode == Mode.FEDERAL else ACTION_LOG
             return Decision(
                 action=action,
@@ -195,7 +250,7 @@ class PolicyEngine:
 
         # 2. Explicit allowlist
         if bundle.tool_allowlist:
-            if tool_name in bundle.tool_allowlist:
+            if normalized_tool in allowlist_norm:
                 return Decision(
                     action=ACTION_ALLOW,
                     reason=f"Tool '{tool_name}' is in the allowlist.",

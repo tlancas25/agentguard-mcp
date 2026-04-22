@@ -96,20 +96,48 @@ if _PYDANTIC_AVAILABLE:
         back_matter: dict[str, Any] = Field(default_factory=dict)
 
 
-def _query_implemented_controls(audit_db_path: Path) -> list[str]:
-    """Query the audit database to determine which controls have been exercised.
+def _collect_audit_evidence(audit_db_path: Path) -> dict[str, Any]:
+    """Return the evidence summary drawn from the audit DB.
 
-    Returns a list of control IDs (lowercase, hyphenated) that appear in the
-    nist_controls_json field of audit events. An exercised control means
-    AgentGuard generated at least one event tagged with that control.
+    Keys:
+        db_exists: bool — the SQLite file is present.
+        chain_valid: Optional[bool] — verify_chain() result, or None if
+                     the file could not be opened.
+        chain_message: Optional[str] — detail from verify_chain().
+        control_counts: dict[str, int] — per-control event count.
+        total_events: int — overall event count.
 
-    If the database does not exist or has no data, falls back to the full
-    set of declared control claims.
+    AG-BL-002: the previous implementation returned the full declared
+    control list regardless of DB state, producing OSCAL output that
+    claimed "implemented" for every control even when no audit DB
+    existed. The OSCAL layer now derives implementation-status from
+    ACTUAL evidence; controls without events or in a broken chain are
+    downgraded to ``planned``.
     """
-    if not audit_db_path.exists():
-        return list(_AGENTGUARD_CONTROL_CLAIMS.keys())
+    evidence: dict[str, Any] = {
+        "db_exists": audit_db_path.exists(),
+        "chain_valid": None,
+        "chain_message": None,
+        "control_counts": {},
+        "total_events": 0,
+    }
+    if not evidence["db_exists"]:
+        evidence["chain_message"] = (
+            f"Audit database not found at {audit_db_path}. No per-control "
+            "evidence available for implementation-status."
+        )
+        return evidence
 
-    exercised: set[str] = set()
+    try:
+        from agentguard.audit_log import AuditLog
+        log = AuditLog(db_path=audit_db_path)
+        valid, msg = log.verify_chain()
+        evidence["chain_valid"] = valid
+        evidence["chain_message"] = msg
+    except Exception as e:
+        evidence["chain_valid"] = False
+        evidence["chain_message"] = f"Could not verify audit chain: {e}"
+
     try:
         conn = sqlite3.connect(str(audit_db_path))
         cur = conn.cursor()
@@ -119,40 +147,84 @@ def _query_implemented_controls(audit_db_path: Path) -> list[str]:
         )
         available_tables = {row[0] for row in cur.fetchall()}
 
+        counts: dict[str, int] = {}
+        total = 0
         for table_name in ("events", "audit_events"):
             if table_name not in available_tables:
                 continue
             cur.execute(
-                f"SELECT DISTINCT nist_controls_json FROM {table_name} "
+                f"SELECT nist_controls_json FROM {table_name} "
                 "WHERE nist_controls_json IS NOT NULL AND nist_controls_json != ''"
             )
             for (controls_json,) in cur.fetchall():
+                total += 1
                 try:
                     controls = json.loads(controls_json)
                     for c in controls:
-                        exercised.add(c.lower().replace("_", "-"))
+                        key = c.lower().replace("_", "-")
+                        counts[key] = counts.get(key, 0) + 1
                 except (json.JSONDecodeError, TypeError):
                     continue
         conn.close()
-    except sqlite3.Error:
-        return list(_AGENTGUARD_CONTROL_CLAIMS.keys())
+        evidence["control_counts"] = counts
+        evidence["total_events"] = total
+    except sqlite3.Error as e:
+        evidence["chain_valid"] = False
+        evidence["chain_message"] = (
+            (evidence["chain_message"] or "")
+            + f" | SQLite read failed: {e}"
+        )
 
-    # Return union of exercised controls and declared claims
-    return sorted(exercised | set(_AGENTGUARD_CONTROL_CLAIMS.keys()))
+    return evidence
 
 
 def _build_implemented_requirements(
-    control_ids: list[str],
     system_name: str,
+    evidence: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Build OSCAL implemented-requirements entries for each control."""
+    """Build OSCAL implemented-requirements entries grounded in evidence.
+
+    implementation-status values:
+        implemented  — control has at least one audit event AND the chain
+                       verifies. Only this value is defensible to an auditor.
+        planned      — no events recorded OR chain verification failed. The
+                       control is claimed in theory but has no backing
+                       evidence in the current audit DB.
+    """
+    chain_ok = bool(evidence.get("chain_valid"))
+    counts: dict[str, int] = evidence.get("control_counts", {}) or {}
+    total = int(evidence.get("total_events", 0))
     requirements = []
-    for control_id in sorted(control_ids):
+    for control_id, description in sorted(_AGENTGUARD_CONTROL_CLAIMS.items()):
         normalized = control_id.lower().replace("_", "-")
-        description = _AGENTGUARD_CONTROL_CLAIMS.get(
-            normalized,
-            f"AgentGuard logs and evaluates events relevant to {control_id.upper()}.",
+        hits = counts.get(normalized, 0)
+        is_implemented = chain_ok and hits > 0
+        status = "implemented" if is_implemented else "planned"
+        statement = (
+            f"{system_name} uses AgentGuard MCP as the tool-call security "
+            f"layer implementing {control_id.upper()}. "
         )
+        if is_implemented:
+            statement += (
+                f"Evidence: {hits} audit event(s) tagged with this control "
+                f"in a verified hash chain (total events: {total})."
+            )
+        elif not evidence.get("db_exists"):
+            statement += (
+                "Status: planned. No audit database present; deploy the "
+                "gateway in dev or federal mode before claiming implementation."
+            )
+        elif not chain_ok:
+            statement += (
+                f"Status: planned. Audit chain verification failed "
+                f"({evidence.get('chain_message', 'unknown error')}); "
+                "regenerate evidence after resolving the integrity break."
+            )
+        else:
+            statement += (
+                "Status: planned. No audit events tagged with this control yet; "
+                "exercise the relevant code path to generate evidence."
+            )
         requirements.append({
             "uuid": str(uuid.uuid4()),
             "control-id": normalized,
@@ -161,17 +233,19 @@ def _build_implemented_requirements(
                 {
                     "name": "implementation-status",
                     "ns": "https://fedramp.gov/ns/oscal",
-                    "value": "implemented",
-                }
+                    "value": status,
+                },
+                {
+                    "name": "agentguard-event-count",
+                    "ns": "https://github.com/tlancas25/agentguard-mcp/ns/oscal",
+                    "value": str(hits),
+                },
             ],
             "statements": [
                 {
                     "statement-id": f"{normalized}_smt",
                     "uuid": str(uuid.uuid4()),
-                    "description": (
-                        f"{system_name} uses AgentGuard MCP as the tool-call security "
-                        f"layer implementing {control_id.upper()}."
-                    ),
+                    "description": statement,
                 }
             ],
         })
@@ -206,8 +280,40 @@ def generate_component_definition(
         "nist.gov/SP800-53/rev5/json/NIST_SP-800-53_rev5_catalog.json"
     )
 
-    control_ids = _query_implemented_controls(audit_db_path)
-    implemented_requirements = _build_implemented_requirements(control_ids, system_name)
+    evidence = _collect_audit_evidence(audit_db_path)
+    implemented_requirements = _build_implemented_requirements(system_name, evidence)
+
+    # Surface the chain-verification outcome in component metadata so a
+    # 3PAO or PMO reviewer sees the evidence status at a glance rather
+    # than taking "implemented" at face value (AG-BL-002).
+    chain_props = [
+        {
+            "name": "audit-db-path",
+            "ns": "https://github.com/tlancas25/agentguard-mcp/ns/oscal",
+            "value": str(audit_db_path),
+        },
+        {
+            "name": "audit-db-present",
+            "ns": "https://github.com/tlancas25/agentguard-mcp/ns/oscal",
+            "value": "true" if evidence.get("db_exists") else "false",
+        },
+        {
+            "name": "audit-chain-status",
+            "ns": "https://github.com/tlancas25/agentguard-mcp/ns/oscal",
+            "value": (
+                "verified"
+                if evidence.get("chain_valid") is True
+                else "failed"
+                if evidence.get("chain_valid") is False
+                else "unknown"
+            ),
+        },
+        {
+            "name": "audit-total-events",
+            "ns": "https://github.com/tlancas25/agentguard-mcp/ns/oscal",
+            "value": str(evidence.get("total_events", 0)),
+        },
+    ]
 
     return {
         "component-definition": {
@@ -259,6 +365,7 @@ def generate_component_definition(
                             "name": "asset-type",
                             "value": "software",
                         },
+                        *chain_props,
                     ],
                     "links": [
                         {
