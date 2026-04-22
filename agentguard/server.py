@@ -100,8 +100,24 @@ class StdioServer:
         queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
         def reader_thread() -> None:
+            # Read raw bytes directly from the underlying file descriptor:
+            # the text-mode `for line in sys.stdin` iterator block-buffers
+            # on Windows pipes, which stalls subprocess-driven MCP clients
+            # until a large input arrives. readline() on the binary buffer
+            # honours line boundaries as soon as each line reaches us.
             try:
-                for line in sys.stdin:
+                raw_stdin = sys.stdin.buffer
+            except AttributeError:
+                raw_stdin = sys.stdin  # type: ignore[assignment]
+            try:
+                while True:
+                    line_bytes = raw_stdin.readline()
+                    if not line_bytes:
+                        break
+                    try:
+                        line = line_bytes.decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
                     asyncio.run_coroutine_threadsafe(
                         queue.put(line.rstrip("\r\n")), loop
                     )
