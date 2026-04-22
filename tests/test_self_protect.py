@@ -222,7 +222,8 @@ class TestModeStandard:
         # (AG-BL-003.R4a/R4b). Pin a known secret so both the gateway
         # and the approver thread compute matching tokens.
         monkeypatch.setenv(
-            "AGENTGUARD_OPERATOR_SECRET", "unit-test-operator-secret"
+            "AGENTGUARD_OPERATOR_SECRET",
+            "unit-test-operator-secret-padded-to-32",
         )
         proxy = _proxy(tmp_path, "standard", timeout=3)
 

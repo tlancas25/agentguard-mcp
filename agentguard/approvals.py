@@ -51,25 +51,52 @@ class ApprovalResult:
     reason: str = ""
 
 
+MIN_OPERATOR_SECRET_BYTES = 32
+
+
 def _load_operator_secret() -> Optional[bytes]:
-    """Return the operator HMAC key, or None if unavailable.
+    """Return the operator HMAC key, or None if unavailable / too weak.
 
     Order of precedence:
         1. ``AGENTGUARD_OPERATOR_SECRET`` env var (hex or raw string).
         2. ``~/.agentguard/operator.secret`` file.
+
+    AG-V11 (trial 4 hardening): reject secrets shorter than
+    ``MIN_OPERATOR_SECRET_BYTES`` (32 bytes). The prior implementation
+    accepted a 1-byte env var and produced valid tokens, which is a
+    trivial brute-force target. Weak secrets are logged loudly and
+    treated as absent.
     """
     from agentguard.config import DEFAULT_AGENTGUARD_HOME
 
+    candidate: Optional[bytes] = None
+    source: str = ""
     env = os.environ.get("AGENTGUARD_OPERATOR_SECRET")
     if env:
-        return env.strip().encode("utf-8")
-    secret_path = DEFAULT_AGENTGUARD_HOME / OPERATOR_SECRET_FILENAME
-    if secret_path.exists():
-        try:
-            return secret_path.read_text(encoding="utf-8").strip().encode("utf-8")
-        except OSError as e:
-            logger.warning("Could not read operator secret %s: %s", secret_path, e)
-    return None
+        candidate = env.strip().encode("utf-8")
+        source = "AGENTGUARD_OPERATOR_SECRET env var"
+    else:
+        secret_path = DEFAULT_AGENTGUARD_HOME / OPERATOR_SECRET_FILENAME
+        if secret_path.exists():
+            try:
+                candidate = secret_path.read_text(
+                    encoding="utf-8"
+                ).strip().encode("utf-8")
+                source = str(secret_path)
+            except OSError as e:
+                logger.warning("Could not read operator secret %s: %s", secret_path, e)
+                return None
+
+    if candidate is None:
+        return None
+    if len(candidate) < MIN_OPERATOR_SECRET_BYTES:
+        logger.error(
+            "Operator secret from %s is %d bytes; minimum is %d. "
+            "Rejecting. Rotate the secret or unset the env var.",
+            source, len(candidate), MIN_OPERATOR_SECRET_BYTES,
+        )
+        return None
+    return candidate
 
 
 def _ensure_operator_secret() -> Optional[Path]:
