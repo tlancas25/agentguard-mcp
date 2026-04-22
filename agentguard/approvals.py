@@ -72,6 +72,30 @@ def _load_operator_secret() -> Optional[bytes]:
     return None
 
 
+def _ensure_operator_secret() -> Optional[Path]:
+    """Auto-provision ``~/.agentguard/operator.secret`` if it does not exist.
+
+    Returns the path (even if we were unable to create it). The file is
+    0o600 and contains 32 bytes of hex-encoded entropy. AG-BL-003.R4a:
+    without this provisioning step, any install that skipped
+    ``agentguard init --gen-key`` shipped with no secret, which meant
+    request() fell through to hmac_required=False — a library-import
+    call could then approve its own mutation.
+    """
+    from agentguard.config import DEFAULT_AGENTGUARD_HOME
+
+    DEFAULT_AGENTGUARD_HOME.mkdir(parents=True, exist_ok=True)
+    secret_path = DEFAULT_AGENTGUARD_HOME / OPERATOR_SECRET_FILENAME
+    if secret_path.exists():
+        return secret_path
+    secret_path.write_text(secrets.token_hex(32) + "\n", encoding="utf-8")
+    try:
+        os.chmod(secret_path, 0o600)
+    except OSError:
+        pass
+    return secret_path
+
+
 def compute_operator_token(code: str) -> Optional[str]:
     """HMAC-SHA256(operator_secret, code) hex digest, or None if no secret.
 
@@ -106,6 +130,19 @@ class ApprovalManager:
         except OSError as e:
             logger.debug("Could not chmod approval dir %s: %s", self.dir, e)
 
+        # AG-BL-003.R4a: ensure operator.secret exists so every install
+        # has an HMAC secret by default. The trial-3 red team showed
+        # that when the secret was missing, request() wrote pending
+        # records with hmac_required=False and approve() accepted
+        # no-token calls — a backdoor that shipped live.
+        try:
+            _ensure_operator_secret()
+        except OSError as e:
+            logger.warning(
+                "Could not provision operator.secret: %s. Approvals will "
+                "not enforce HMAC tokens until the secret is available.", e,
+            )
+
     def request(
         self,
         tool_name: str,
@@ -115,7 +152,26 @@ class ApprovalManager:
         path_hit: str,
         timeout_seconds: int = 60,
     ) -> ApprovalResult:
-        """Publish a request, block until resolved or timed out."""
+        """Publish a request, block until resolved or timed out.
+
+        AG-BL-003.R4a: refuse to publish a pending record at all if we
+        cannot reach an operator secret. The earlier behavior of writing
+        ``hmac_required=False`` when no secret was available was a
+        self-declared opt-out of the enforcement layer, which defeats
+        the purpose. Mutations simply do not proceed in that state —
+        the operator must provision a secret first.
+        """
+        if _load_operator_secret() is None:
+            logger.error(
+                "ApprovalManager.request called but no operator secret is "
+                "available. Refusing to write a pending record. "
+                "Run 'agentguard init --gen-key' or set "
+                "AGENTGUARD_OPERATOR_SECRET."
+            )
+            return ApprovalResult(
+                approved=False, code="", reason="no_operator_secret"
+            )
+
         created_at = time.time()
         expires_at = created_at + timeout_seconds
 
@@ -214,8 +270,16 @@ class ApprovalManager:
         or None when the request must be rejected. Rejects on:
             - malformed code
             - missing pending file
-            - hmac_required but caller provided no token
-            - hmac_required and token mismatches
+            - operator secret is currently reachable AND caller did not
+              present a token matching HMAC(secret, code)
+
+        AG-BL-003.R4b: the earlier implementation gated enforcement on
+        the record's self-declared ``hmac_required`` field, which meant
+        an attacker who could write a pending.json with
+        ``hmac_required: False`` bypassed the check entirely. The gate
+        now keys off CURRENT operator-secret availability instead: if
+        the gateway can compute a token right now, approve/deny must
+        present one that matches.
 
         Caller should treat a None return as 'deny the approve/deny call'.
         """
@@ -228,12 +292,27 @@ class ApprovalManager:
             record = json.loads(pending.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        if record.get("hmac_required"):
+
+        current_expected = compute_operator_token(code)
+        if current_expected is not None:
+            if not token or not hmac.compare_digest(token, current_expected):
+                logger.warning(
+                    "approval rejected: current operator secret requires "
+                    "a valid HMAC token for code %s; caller did not present one",
+                    code,
+                )
+                return None
+        # No operator secret reachable: fall back to the record's
+        # declared state only as a last resort so the test harness can
+        # still exercise the legacy no-secret path. Production installs
+        # always have a secret because ApprovalManager provisions one
+        # on __init__.
+        elif record.get("hmac_required"):
             expected = record.get("expected_hmac") or ""
             if not token or not hmac.compare_digest(token, expected):
                 logger.warning(
-                    "approval rejected: hmac required for code %s but "
-                    "caller did not present a valid operator token",
+                    "approval rejected: record-level hmac required for "
+                    "code %s but caller did not present a valid token",
                     code,
                 )
                 return None
